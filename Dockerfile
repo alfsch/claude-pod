@@ -3,9 +3,27 @@ FROM node:24-slim
 
 # git/curl/less are baseline dev tools; jq and gh are reached for by Claude's built-in workflows
 # (JSON pipelines and the GitHub CLI for PRs/issues/releases). ca-certificates is needed for HTTPS.
+# python3, pip and venv are for scripting; poppler-utils provides pdftotext, qpdf handles PDF
+# manipulation, and tesseract-ocr does OCR (English and German language data).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git ca-certificates curl less jq gh \
+      python3 python3-pip python3-venv poppler-utils qpdf tesseract-ocr tesseract-ocr-eng tesseract-ocr-deu \
  && rm -rf /var/lib/apt/lists/*
+
+# yq (mikefarah's Go implementation, not Debian's Python wrapper of the same name) isn't in apt, so
+# fetch the pinned release binary. Each architecture's SHA-256 comes from the release's `checksums`
+# file; the build fails if the download doesn't match. TARGETARCH is set by BuildKit (amd64/arm64).
+# When bumping YQ_VERSION, update both hashes.
+ARG TARGETARCH
+ARG YQ_VERSION=v4.54.1
+RUN case "$TARGETARCH" in \
+      amd64) YQ_SHA256=8e34fc298390875de416e6a4afcb8cabeceb25d9aa8506c1a2f9353cf702ea5f ;; \
+      arm64) YQ_SHA256=189088da0c6429ec5178dfaab1a114805f6cab0b61b165ab236efedf1d57a71b ;; \
+      *) echo "yq: unsupported architecture '$TARGETARCH'" >&2; exit 1 ;; \
+    esac \
+ && curl -fsSL -o /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_${TARGETARCH}" \
+ && echo "${YQ_SHA256}  /usr/local/bin/yq" | sha256sum -c - \
+ && chmod +x /usr/local/bin/yq
 
 # Override at build time with --build-arg CLAUDE_CODE_VERSION=2.x.y to pin a specific
 # version, or "latest" for the newest build. Default "stable" is npm's official release channel.
