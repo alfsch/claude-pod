@@ -1,0 +1,23 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "customManagers": [
+    {
+      "description": "Keep the node base image literal in uninstall.sh and the README in sync with the Dockerfile",
+      "customType": "regex",
+      "managerFilePatterns": ["/^uninstall\\.sh$/", "/^README\\.md$/"],
+      "matchStrings": ["node:(?<currentValue>\\d[\\w.]*-slim)"],
+      "depNameTemplate": "node",
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "docker"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Bump the node base image everywhere in one PR",
+      "matchDepNames": ["node"],
+      "matchDatasources": ["docker"],
+      "groupName": "node base image"
+    }
+  ]
+}
