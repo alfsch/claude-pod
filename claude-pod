@@ -20,6 +20,7 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
   printf '\n%sManage%s  (works from any folder):\n' "$BOLD" "$RESET"
   row "Install/update:" "$HERE/install.sh"
   row "Pin a version:"  "CLAUDE_CODE_VERSION=2.0.0 $HERE/install.sh"
+  row "Newest build:"   "CLAUDE_CODE_VERSION=latest $HERE/install.sh"
   row "Uninstall:"      "$HERE/uninstall.sh"
   printf '\n%sOptions%s  (prefix any run command):\n' "$BOLD" "$RESET"
   row "Publish ports:"  "PORTS=\"3000 5173\" $HERE/claude-pod"
@@ -43,6 +44,26 @@ if [ -z "$(docker image ls -q claude-pod 2>/dev/null)" ]; then
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   err "Image 'claude-pod' not found."
   die "Please run '${BOLD}${SCRIPT_DIR}/install.sh${RESET}' first to build the local container."
+fi
+
+# Auto-update on every start: if the image was built from the "stable" channel (label set by
+# install.sh) and npm's current stable differs from what's installed, rebuild via install.sh before
+# launching. Images pinned to a version or to "latest" are left alone, as are images built before
+# the labels existed (re-run install.sh once to opt in). The check is best-effort: a slow/offline
+# registry (3s cap) or a failed rebuild only prints a note and continues with the existing image.
+# Set CLAUDE_POD_NO_UPDATE=1 to skip it. Output goes to stderr so piped stdout stays clean.
+if [ -z "${CLAUDE_POD_NO_UPDATE:-}" ] && command -v curl >/dev/null; then
+  _label() { docker image inspect --format "{{index .Config.Labels \"$1\"}}" claude-pod 2>/dev/null || true; }
+  if [ "$(_label claude-pod.channel)" = "stable" ]; then
+    _installed="$(_label claude-pod.version)"
+    _stable="$(curl -fsSL --max-time 3 https://registry.npmjs.org/-/package/@anthropic-ai/claude-code/dist-tags 2>/dev/null \
+      | sed -n 's/.*"stable"[[:space:]]*:[[:space:]]*"\([0-9][^"]*\)".*/\1/p' || true)"
+    if [ -n "$_stable" ] && [ "$_stable" != "$_installed" ]; then
+      printf '%s●%s New stable Claude Code %s (installed: %s) — updating image...\n' "$BOLD" "$RESET" "$_stable" "${_installed:-unknown}" >&2
+      "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/install.sh" >&2 \
+        || err "Update failed; continuing with the existing image."
+    fi
+  fi
 fi
 
 # Host-side state dir: persists Claude's auth + history across container restarts.

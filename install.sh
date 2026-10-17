@@ -13,16 +13,36 @@ trap 'err "install.sh failed at line $LINENO"' ERR
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IMAGE="claude-pod"
-CLAUDE_CODE_VERSION="${CLAUDE_CODE_VERSION:-latest}"
+# Default to npm's "stable" dist-tag (the official release channel). "latest" (newest build) is
+# only used when explicitly requested via CLAUDE_CODE_VERSION=latest.
+CLAUDE_CODE_VERSION="${CLAUDE_CODE_VERSION:-stable}"
 
 command -v docker >/dev/null || die "Docker is required but not on PATH."
 docker info >/dev/null 2>&1 || die "Docker daemon is not running."
 
+# What the user asked for ("stable", "latest" or a number); stored as an image label so the
+# claude-pod launcher knows whether it may auto-update this image.
+CHANNEL="$CLAUDE_CODE_VERSION"
+
+# Resolve "stable" to a concrete version from the npm registry, so the version number becomes the
+# cache key: the npm layer is reused while stable is unchanged and rebuilt when it moves. If the
+# lookup fails, the tag stays as is and gets the CACHEBUST fallback below.
+if [ "$CLAUDE_CODE_VERSION" = "stable" ]; then
+  RESOLVED_STABLE="$(curl -fsSL --max-time 10 https://registry.npmjs.org/-/package/@anthropic-ai/claude-code/dist-tags 2>/dev/null \
+    | sed -n 's/.*"stable"[[:space:]]*:[[:space:]]*"\([0-9][^"]*\)".*/\1/p' || true)"
+  if [ -n "$RESOLVED_STABLE" ]; then
+    CLAUDE_CODE_VERSION="$RESOLVED_STABLE"
+  else
+    printf '%s  Could not resolve "stable" from npm; building without cache for this step.%s\n' "$DIM" "$RESET"
+  fi
+fi
+
 # For pinned versions, the version literal in the Dockerfile RUN line is itself the cache key,
 # so the layer rebuilds whenever the pin changes — no extra invalidator needed.
-# For "latest", the literal never changes, so we pass CACHEBUST=$(date +%s) to force a refetch.
-BUILD_ARGS=("--build-arg" "CLAUDE_CODE_VERSION=$CLAUDE_CODE_VERSION")
-if [ "$CLAUDE_CODE_VERSION" = "latest" ]; then
+# For dist-tags ("latest", or an unresolved "stable"), the literal never changes while the version
+# it points to does, so we pass CACHEBUST=$(date +%s) to force a refetch.
+BUILD_ARGS=("--build-arg" "CLAUDE_CODE_VERSION=$CLAUDE_CODE_VERSION" "--build-arg" "CLAUDE_CODE_CHANNEL=$CHANNEL")
+if [[ ! "$CLAUDE_CODE_VERSION" =~ ^[0-9] ]]; then
   BUILD_ARGS+=("--build-arg" "CACHEBUST=$(date +%s)")
 fi
 
