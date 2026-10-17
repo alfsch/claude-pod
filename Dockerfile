@@ -20,7 +20,7 @@ RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 # Recorded for the claude-pod launcher: it only auto-updates images built from the "stable" channel
 # (CLAUDE_CODE_CHANNEL, what the user asked for) and compares the installed version label against
 # npm's current stable. Declared after the install so changing them doesn't invalidate that layer.
-ARG CLAUDE_CODE_CHANNEL=stable
+ARG CLAUDE_CODE_CHANNEL=${CLAUDE_CODE_VERSION}
 LABEL claude-pod.channel=${CLAUDE_CODE_CHANNEL} \
       claude-pod.version=${CLAUDE_CODE_VERSION}
 

@@ -60,7 +60,8 @@ if [ -z "${CLAUDE_POD_NO_UPDATE:-}" ] && command -v curl >/dev/null; then
       | sed -n 's/.*"stable"[[:space:]]*:[[:space:]]*"\([0-9][^"]*\)".*/\1/p' || true)"
     if [ -n "$_stable" ] && [ "$_stable" != "$_installed" ]; then
       printf '%s●%s New stable Claude Code %s (installed: %s) — updating image...\n' "$BOLD" "$RESET" "$_stable" "${_installed:-unknown}" >&2
-      "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/install.sh" >&2 \
+      # Force stable: an exported CLAUDE_CODE_VERSION must not turn this into a pinned/latest image.
+      CLAUDE_CODE_VERSION=stable "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/install.sh" >&2 \
         || err "Update failed; continuing with the existing image."
     fi
   fi
