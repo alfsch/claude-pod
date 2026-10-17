@@ -53,6 +53,11 @@ printf '  %simage:         %s %s\n' "$DIM" "$RESET" "$IMAGE"
 printf '  %sclaude-code:   %s %s\n' "$DIM" "$RESET" "$CLAUDE_CODE_VERSION"
 echo
 
+# Build under a temporary tag and only move the real tag after the new image proves it works, so a
+# failed build or a broken `claude` binary never replaces a working image (this matters because
+# claude-pod auto-updates on start).
+TMP_IMAGE="$IMAGE:new"
+
 info "Building image '$IMAGE'"
 # Stream the build output dimmed and indented. `--progress=plain` disables BuildKit's animated
 # TUI (which can't be re-styled externally); the sed strips Docker's own ANSI codes so they don't
@@ -60,20 +65,24 @@ info "Building image '$IMAGE'"
 docker build \
   --progress=plain \
   "${BUILD_ARGS[@]}" \
-  -t "$IMAGE" "$REPO_DIR" 2>&1 \
+  -t "$TMP_IMAGE" "$REPO_DIR" 2>&1 \
   | sed $'s/\e\\[[0-9;]*m//g' \
   | while IFS= read -r line; do printf '%s  %s%s\n' "$DIM" "$line" "$RESET"; done
-ok "Image '$IMAGE' built"
+ok "Image built"
 echo
 
-info "Installed"
-# `claude --version` prints the resolved npm version. Wrapped in if/else so a failure here
-# (e.g. claude binary unexpectedly broken) is reported but doesn't abort the script via the ERR trap.
-if RESOLVED_VERSION="$(docker run --rm "$IMAGE" claude --version 2>&1)"; then
+info "Verifying"
+# `claude --version` prints the resolved npm version. Wrapped in if/else so a failure is reported
+# with a clear message instead of tripping the ERR trap; the previous image stays untouched.
+if RESOLVED_VERSION="$(docker run --rm "$TMP_IMAGE" claude --version 2>&1)"; then
   printf '  %sclaude-code:   %s %s\n' "$DIM" "$RESET" "$RESOLVED_VERSION"
 else
-  err "Could not determine Claude Code version (build succeeded; 'claude --version' failed)"
+  docker rmi "$TMP_IMAGE" >/dev/null 2>&1 || true
+  die "New image failed 'claude --version' ($RESOLVED_VERSION); keeping the previous '$IMAGE' image."
 fi
+docker tag "$TMP_IMAGE" "$IMAGE:latest"
+docker rmi "$TMP_IMAGE" >/dev/null
+ok "Image '$IMAGE' installed"
 echo
 
 info "Next steps"
