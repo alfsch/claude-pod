@@ -55,8 +55,11 @@ echo
 
 # Build under a temporary tag and only move the real tag after the new image proves it works, so a
 # failed build or a broken `claude` binary never replaces a working image (this matters because
-# claude-pod auto-updates on start).
-TMP_IMAGE="$IMAGE:new"
+# claude-pod auto-updates on start). The tag is unique per invocation ($$ = PID) so concurrent
+# installers can never verify one image and promote another; the EXIT trap removes it on any exit
+# (failed build, failed verification, success), leaving only the promoted claude-pod tag.
+TMP_IMAGE="$IMAGE:new-$$"
+trap 'docker rmi "$TMP_IMAGE" >/dev/null 2>&1 || true' EXIT
 
 info "Building image '$IMAGE'"
 # Stream the build output dimmed and indented. `--progress=plain` disables BuildKit's animated
@@ -77,11 +80,9 @@ info "Verifying"
 if RESOLVED_VERSION="$(docker run --rm "$TMP_IMAGE" claude --version 2>&1)"; then
   printf '  %sclaude-code:   %s %s\n' "$DIM" "$RESET" "$RESOLVED_VERSION"
 else
-  docker rmi "$TMP_IMAGE" >/dev/null 2>&1 || true
   die "New image failed 'claude --version' ($RESOLVED_VERSION); keeping the previous '$IMAGE' image."
 fi
 docker tag "$TMP_IMAGE" "$IMAGE:latest"
-docker rmi "$TMP_IMAGE" >/dev/null
 ok "Image '$IMAGE' installed"
 echo
 
