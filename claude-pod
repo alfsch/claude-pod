@@ -172,12 +172,18 @@ DOCKER_FLAGS+=("--pids-limit=${PIDS:-4096}")
 # iTerm2, VS Code, WezTerm, etc., or nothing when the host doesn't advertise it, so a non-truecolor
 # terminal is never forced into colors it can't render. Without this, docker leaves the container at
 # TERM=xterm with no COLORTERM and supports-color downshifts the whole UI to 16 colors.
+#
+# DISABLE_AUTOUPDATER=1 turns off Claude Code's built-in self-updater. Inside the container it can't
+# work (the unprivileged runtime user has no write access to the root-owned npm prefix, so it only prints
+# "Auto-update failed"), and updates are handled by rebuilding the image instead: the start-up check
+# above for the stable channel, or install.sh for a pinned version.
 exec docker run "${DOCKER_FLAGS[@]}" \
   --cap-drop=ALL \
   --security-opt=no-new-privileges \
   --user "$(id -u):$(id -g)" \
   -e HOME=/home/claude-pod \
   -e COLORTERM \
+  -e DISABLE_AUTOUPDATER=1 \
   -v "$PWD:$PWD" \
   -w "$PWD" \
   -v "$HOME/.claude-pod:/home/claude-pod/.claude" \
