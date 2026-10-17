@@ -20,6 +20,7 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
   printf '\n%sManage%s  (works from any folder):\n' "$BOLD" "$RESET"
   row "Install/update:" "$HERE/install.sh"
   row "Pin a version:"  "CLAUDE_CODE_VERSION=2.0.0 $HERE/install.sh"
+  row "Newest build:"   "CLAUDE_CODE_VERSION=latest $HERE/install.sh"
   row "Uninstall:"      "$HERE/uninstall.sh"
   printf '\n%sOptions%s  (prefix any run command):\n' "$BOLD" "$RESET"
   row "Publish ports:"  "PORTS=\"3000 5173\" $HERE/claude-pod"
@@ -43,6 +44,35 @@ if [ -z "$(docker image ls -q claude-pod 2>/dev/null)" ]; then
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   err "Image 'claude-pod' not found."
   die "Please run '${BOLD}${SCRIPT_DIR}/install.sh${RESET}' first to build the local container."
+fi
+
+# Auto-update on every start: if the image was built from the "stable" channel (label set by
+# install.sh) and npm's current stable differs from what's installed, rebuild via install.sh before
+# launching. Images pinned to a version or to "latest" are left alone, as are images built before
+# the labels existed (re-run install.sh once to opt in). The check is best-effort: a slow/offline
+# registry (3s cap) or a failed rebuild only prints a note and continues with the existing image.
+# Set CLAUDE_POD_NO_UPDATE=1 to skip it. Output goes to stderr so piped stdout stays clean.
+if [ -z "${CLAUDE_POD_NO_UPDATE:-}" ] && command -v curl >/dev/null; then
+  # Inspect by image ID (found via `image ls -q`, like the preflight above), not by name — see the
+  # Docker Desktop note there. A failed lookup leaves the labels empty, which just skips the update.
+  _image_id="$(docker image ls -q claude-pod:latest 2>/dev/null | head -n1 || true)"
+  _label() { [ -n "$_image_id" ] && docker image inspect --format "{{index .Config.Labels \"$1\"}}" "$_image_id" 2>/dev/null || true; }
+  if [ "$(_label claude-pod.channel)" = "stable" ]; then
+    _installed="$(_label claude-pod.version)"
+    # If install.sh couldn't resolve "stable" at build time, the label holds the literal tag; ask the
+    # image for the real version so an up-to-date image isn't needlessly rebuilt.
+    if [[ ! "$_installed" =~ ^[0-9] ]]; then
+      _installed="$(docker run --rm claude-pod claude --version 2>/dev/null | sed -n 's/^\([0-9][0-9.]*\).*/\1/p' || true)"
+    fi
+    _stable="$(curl -fsSL --max-time 3 https://registry.npmjs.org/-/package/@anthropic-ai/claude-code/dist-tags 2>/dev/null \
+      | sed -n 's/.*"stable"[[:space:]]*:[[:space:]]*"\([0-9][^"]*\)".*/\1/p' || true)"
+    if [ -n "$_stable" ] && [ "$_stable" != "$_installed" ]; then
+      printf '%s●%s New stable Claude Code %s (installed: %s) — updating image...\n' "$BOLD" "$RESET" "$_stable" "${_installed:-unknown}" >&2
+      # Force stable: an exported CLAUDE_CODE_VERSION must not turn this into a pinned/latest image.
+      CLAUDE_CODE_VERSION=stable "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/install.sh" >&2 \
+        || err "Update failed; continuing with the existing image."
+    fi
+  fi
 fi
 
 # Host-side state dir: persists Claude's auth + history across container restarts.

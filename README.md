@@ -146,7 +146,7 @@ The workaround:
 
 ### Updating or pinning the Claude Code version
 
-By default, `install.sh` fetches whatever's currently `latest` on npm, bypassing Docker's cache for that step. It resolves its own location, so you can re-run it from any folder:
+By default, `install.sh` installs the current official release (npm's `stable` dist-tag). It resolves `stable` to a concrete version first, so Docker's cache is reused until a new stable release appears. It resolves its own location, so you can re-run it from any folder:
 
 ```sh
 ~/tools/claude-pod/install.sh
@@ -157,6 +157,14 @@ To pin a specific version, set `CLAUDE_CODE_VERSION`:
 ```sh
 CLAUDE_CODE_VERSION=2.0.0 ~/tools/claude-pod/install.sh
 ```
+
+To track the newest build instead of the official release, pin to `latest` (always refetched, bypassing Docker's cache):
+
+```sh
+CLAUDE_CODE_VERSION=latest ~/tools/claude-pod/install.sh
+```
+
+**Automatic updates on start.** If the image was built from the default `stable` channel, every `claude-pod` start checks npm for a newer stable release (3-second timeout) and, if there is one, rebuilds the image via `install.sh` before launching. Offline or failed check/rebuild? It prints a note and continues with the existing image. Images pinned to a version or to `latest` are never auto-updated, and neither is an image built before this feature existed — re-run `install.sh` once to opt in. Skip the check for a single run with `CLAUDE_POD_NO_UPDATE=1 claude-pod`.
 
 Pinned versions cache normally across rebuilds. The script prints the resolved version after each build, so you always know what you got.
 

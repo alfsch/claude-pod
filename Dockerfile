@@ -8,15 +8,21 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # Override at build time with --build-arg CLAUDE_CODE_VERSION=2.x.y to pin a specific
-# version. Default "latest" tracks whatever's current on npm.
-ARG CLAUDE_CODE_VERSION=latest
+# version, or "latest" for the newest build. Default "stable" is npm's official release channel.
+ARG CLAUDE_CODE_VERSION=stable
 
-# When CLAUDE_CODE_VERSION=latest, install.sh passes CACHEBUST=$(date +%s) to force a fresh
-# refetch (the literal "latest" alone wouldn't change the layer's cache key). For pinned
-# versions, the version literal itself is the cache key, so install.sh skips CACHEBUST and
-# this layer caches normally.
+# install.sh resolves "stable" to a concrete version, so the version literal itself is the cache
+# key and this layer caches normally. For "latest" (a tag whose literal never changes), install.sh
+# passes CACHEBUST=$(date +%s) to force a fresh refetch.
 ARG CACHEBUST=1
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
+
+# Recorded for the claude-pod launcher: it only auto-updates images built from the "stable" channel
+# (CLAUDE_CODE_CHANNEL, what the user asked for) and compares the installed version label against
+# npm's current stable. Declared after the install so changing them doesn't invalidate that layer.
+ARG CLAUDE_CODE_CHANNEL=${CLAUDE_CODE_VERSION}
+LABEL claude-pod.channel=${CLAUDE_CODE_CHANNEL} \
+      claude-pod.version=${CLAUDE_CODE_VERSION}
 
 # We DO NOT use `USER node` here. Instead, we pass `--user "$(id -u):$(id -g)"` dynamically
 # at runtime in the `claude-pod` script. This ensures perfect file permission alignment
