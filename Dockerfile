@@ -3,11 +3,11 @@ FROM node:24-slim
 
 # git/curl/less are baseline dev tools; jq and gh are reached for by Claude's built-in workflows
 # (JSON pipelines and the GitHub CLI for PRs/issues/releases). ca-certificates is needed for HTTPS.
-# python3 and pip are for scripting; poppler-utils provides pdftotext, qpdf handles PDF
+# python3, pip and venv are for scripting; poppler-utils provides pdftotext, qpdf handles PDF
 # manipulation, and tesseract-ocr does OCR (English and German language data).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git ca-certificates curl less jq gh \
-      python3 python3-pip poppler-utils qpdf tesseract-ocr tesseract-ocr-eng tesseract-ocr-deu \
+      python3 python3-pip python3-venv poppler-utils qpdf tesseract-ocr tesseract-ocr-eng tesseract-ocr-deu \
  && rm -rf /var/lib/apt/lists/*
 
 # yq (mikefarah's Go implementation, not Debian's Python wrapper of the same name) isn't in apt, so
