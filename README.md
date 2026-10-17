@@ -170,7 +170,7 @@ Pinned versions cache normally across rebuilds. The script prints the resolved v
 
 ### Customizing the image
 
-The image is intentionally minimal: `node:24-slim` + `git` + `curl` + `less` + `jq` + `gh` + Claude Code. Nothing language-specific. Anything your projects need (Python, build tools, other toolchains) you add yourself — edit the `Dockerfile` and re-run `~/tools/claude-pod/install.sh`.
+The image is intentionally minimal: `node:24-slim` + `git` + `curl` + `less` + `jq` + `gh` + `yq` + `python3` + `pdftotext` (poppler-utils) + `qpdf` + `tesseract` (English) + Claude Code. Nothing project-specific. Anything else your projects need (pip, build tools, other toolchains, more OCR languages) you add yourself — edit the `Dockerfile` and re-run `~/tools/claude-pod/install.sh`.
 
 ## Security and limits
 
@@ -178,7 +178,7 @@ The image is intentionally minimal: `node:24-slim` + `git` + `curl` + `less` + `
 
 The whole tool is four tiny files:
 
-- **`Dockerfile`** — `node:24-slim` + `git` + `curl` + `less` + `jq` + `gh` + `@anthropic-ai/claude-code`.
+- **`Dockerfile`** — `node:24-slim` + `git` + `curl` + `less` + `jq` + `gh` + `yq` + `python3` + `poppler-utils` + `qpdf` + `tesseract-ocr` + `@anthropic-ai/claude-code`.
 - **`claude-pod`** — one `docker run` command that mounts your current directory (plus a small state dir for login and history) and nothing else of your machine.
 - **`install.sh`** — checks Docker and builds the image. Doesn't touch any system path; the tool stays self-contained in this folder.
 - **`uninstall.sh`** — removes the image and `~/.claude-pod/` (auth + session history) after confirmation. Lists what it doesn't touch so you can clean those up yourself.
