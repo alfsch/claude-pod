@@ -11,19 +11,10 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # yq (mikefarah's Go implementation, not Debian's Python wrapper of the same name) isn't in apt, so
-# fetch the pinned release binary. Each architecture's SHA-256 comes from the release's `checksums`
-# file; the build fails if the download doesn't match. TARGETARCH is set by BuildKit (amd64/arm64).
-# When bumping YQ_VERSION, update both hashes.
-ARG TARGETARCH
-ARG YQ_VERSION=v4.54.1
-RUN case "$TARGETARCH" in \
-      amd64) YQ_SHA256=8e34fc298390875de416e6a4afcb8cabeceb25d9aa8506c1a2f9353cf702ea5f ;; \
-      arm64) YQ_SHA256=189088da0c6429ec5178dfaab1a114805f6cab0b61b165ab236efedf1d57a71b ;; \
-      *) echo "yq: unsupported architecture '$TARGETARCH'" >&2; exit 1 ;; \
-    esac \
- && curl -fsSL -o /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_${TARGETARCH}" \
- && echo "${YQ_SHA256}  /usr/local/bin/yq" | sha256sum -c - \
- && chmod +x /usr/local/bin/yq
+# copy the static binary out of the official multi-arch image; Docker picks the right architecture.
+# The tag@digest pair is kept current by Renovate (see renovate.json), and the digest pins the exact
+# image contents.
+COPY --from=mikefarah/yq:4.54.1@sha256:4b3d9475d65571d28cbb19544d3820ec2945e4c8b2f18279394282b8dc3a592e /usr/bin/yq /usr/local/bin/yq
 
 # Override at build time with --build-arg CLAUDE_CODE_VERSION=2.x.y to pin a specific
 # version, or "latest" for the newest build. Default "stable" is npm's official release channel.

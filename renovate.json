@@ -18,6 +18,12 @@
       "matchDepNames": ["node"],
       "matchDatasources": ["docker"],
       "groupName": "node base image"
+    },
+    {
+      "description": "Pin yq's image digest (the Dockerfile COPYs the binary out of it); Renovate updates tag and digest together",
+      "matchDepNames": ["mikefarah/yq"],
+      "matchDatasources": ["docker"],
+      "pinDigests": true
     }
   ]
 }
