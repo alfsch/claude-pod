@@ -1,6 +1,7 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:recommended"],
+  "forkProcessing": "enabled",
   "customManagers": [
     {
       "description": "Keep the node base image literal in uninstall.sh and the README in sync with the Dockerfile",
