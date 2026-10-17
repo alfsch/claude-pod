@@ -55,7 +55,7 @@ fi
 if [ -z "${CLAUDE_POD_NO_UPDATE:-}" ] && command -v curl >/dev/null; then
   # Inspect by image ID (found via `image ls -q`, like the preflight above), not by name — see the
   # Docker Desktop note there. A failed lookup leaves the labels empty, which just skips the update.
-  _image_id="$(docker image ls -q claude-pod 2>/dev/null | head -n1 || true)"
+  _image_id="$(docker image ls -q claude-pod:latest 2>/dev/null | head -n1 || true)"
   _label() { [ -n "$_image_id" ] && docker image inspect --format "{{index .Config.Labels \"$1\"}}" "$_image_id" 2>/dev/null || true; }
   if [ "$(_label claude-pod.channel)" = "stable" ]; then
     _installed="$(_label claude-pod.version)"
