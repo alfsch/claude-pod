@@ -90,4 +90,7 @@ info "Next steps"
 printf '  cd into your work-in-progress project folder first, then:\n'
 printf '    Open shell in pod:        %s%s/claude-pod%s\n' "$BOLD" "$REPO_DIR" "$RESET"
 printf '    Or run Claude directly:   %s%s/claude-pod claude --dangerously-skip-permissions%s\n' "$BOLD" "$REPO_DIR" "$RESET"
+printf '    Shell with Docker:        %sDOCKER=1 %s/claude-pod%s\n' "$BOLD" "$REPO_DIR" "$RESET"
+printf '    Claude with Docker:       %sDOCKER=1 %s/claude-pod claude --dangerously-skip-permissions%s\n' "$BOLD" "$REPO_DIR" "$RESET"
+printf '    Docker + image cache:     %sDOCKER=1 DOCKER_CACHE=1 %s/claude-pod%s\n' "$BOLD" "$REPO_DIR" "$RESET"
 printf '    Optional shell alias:     %salias claude-pod=%s/claude-pod%s\n' "$BOLD" "$REPO_DIR" "$RESET"
