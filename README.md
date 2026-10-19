@@ -34,6 +34,9 @@ cd ~/projects/your-project
 
 # Long path? You can alias it — see "Aliases" below.
 
+# Need Docker inside the pod? Prefix with DOCKER=1 — see "Using Docker inside the pod" below.
+# DOCKER=1 ~/tools/claude-pod/claude-pod
+
 # Forgot a command later? Print a copy-pastable cheatsheet of all of them
 ~/tools/claude-pod/claude-pod --help
 ```
@@ -48,6 +51,8 @@ Docker is the only requirement — no Node.js, npm, or `claude` needed on your h
   - [Aliases](#aliases)
   - [First launch (login)](#first-launch-login)
   - [Exposing ports](#exposing-ports)
+  - [Using Docker inside the pod](#using-docker-inside-the-pod)
+    - [Keeping images between sessions](#keeping-images-between-sessions)
   - [Pasting images and screenshots](#pasting-images-and-screenshots)
   - [Updating or pinning the Claude Code version](#updating-or-pinning-the-claude-code-version)
   - [Customizing the image](#customizing-the-image)
@@ -132,6 +137,86 @@ PORTS="5173:5173" ~/tools/claude-pod/claude-pod
 > - **Rails:** `rails s -b 0.0.0.0`
 >
 > The host-side mapping is still `127.0.0.1`-only (forced by `claude-pod`), so binding `0.0.0.0` inside the container does not expose your dev server to your LAN.
+
+### Using Docker inside the pod
+
+Set `DOCKER=1` to get a throwaway Docker daemon for the session (build images, run containers, `docker compose`).
+
+**Quick start**
+
+1. Make sure the image is current. The `docker` CLI was added to the image, so re-run the installer once if you built it earlier:
+
+   ```sh
+   ~/tools/claude-pod/install.sh
+   ```
+
+2. `cd` into your project and launch with `DOCKER=1`, either into a shell or straight into Claude:
+
+   ```sh
+   cd ~/projects/your-project
+   DOCKER=1 ~/tools/claude-pod/claude-pod                 # shell
+   DOCKER=1 ~/tools/claude-pod/claude-pod claude --dangerously-skip-permissions  # straight into Claude
+   ```
+
+   You'll see `● Starting Docker sidecar...` for a few seconds on the first start while the sidecar image is pulled.
+
+3. Use Docker as usual inside the pod:
+
+   ```sh
+   docker version          # client and server should both answer
+   docker run --rm hello-world
+   docker compose up -d
+   ```
+
+Combine it with the other options if you like, e.g. `DOCKER=1 MEMORY=8g CPUS=4 PORTS=3000 claude-pod`. With an alias (see [Aliases](#aliases)) it is just `DOCKER=1 claude-pod`.
+
+If it doesn't start, check that your own Docker can run privileged containers (the sidecar needs `--privileged`) and that you aren't also setting `NET=none`. A sidecar that never becomes ready prints its last log lines.
+
+How it works: `claude-pod` starts a separate **rootless Docker-in-Docker sidecar** (`docker:28-dind-rootless`) on a private per-run network and points the pod's `docker` CLI at it. Only the sidecar runs `--privileged`; the pod keeps all its hardening (no capabilities, `no-new-privileges`, default seccomp). The host's Docker socket is never mounted. The daemon is only reachable with a per-run client certificate (mutual TLS), shared with the pod through a throwaway volume. The sidecar, network and volume are removed when the session ends, taking its images and containers with it. It works on Linux, macOS and Windows (WSL2).
+
+**Requirements for `DOCKER=1`**
+
+- A Docker host where privileged containers are allowed (Docker Desktop on macOS/Windows works out of the box).
+- On Linux the rootless daemon in the sidecar needs unprivileged user namespaces. Ubuntu 24.04 and newer restrict them through AppArmor, and the sidecar then fails with `rootlesskit ... fork/exec /proc/self/exe: operation not permitted` (the launcher points here). Check with `sysctl kernel.apparmor_restrict_unprivileged_userns`; if it is `1`, allow them permanently:
+
+  ```sh
+  echo 'kernel.apparmor_restrict_unprivileged_userns = 0' | sudo tee /etc/sysctl.d/99-claude-pod-userns.conf
+  sudo sysctl --system
+  ```
+
+  or only until the next reboot: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`. This loosens the restriction for every program on the machine, not just claude-pod. To undo it, delete the file and set the value back explicitly, because `sysctl --system` only applies configured values and does not restore the kernel default (a reboot works too):
+
+  ```sh
+  sudo rm /etc/sysctl.d/99-claude-pod-userns.conf
+  sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1
+  ```
+- The rootless daemon runs without cgroups, so `docker run --memory/--cpus` inside the pod has no effect. `MEMORY`, `CPUS` and `PIDS` still limit the sidecar as a whole.
+
+Things to know:
+
+- The sidecar is privileged (inside Docker's VM on macOS/Windows). A kernel or runtime escape from it would be more serious than from the default pod, so use `DOCKER=1` only on projects you trust.
+- The project folder is mounted into the sidecar at the same path, so `docker run -v "$PWD:/app" ...` works. The sidecar runs as uid 1000; if your host uid differs, inner containers may not be able to write to the project.
+- Both Docker images (the CLI in the pod, the sidecar) are pinned by digest; `DIND_IMAGE` overrides the sidecar.
+- Ports published by inner containers (`docker run -p ...`) live on the sidecar's network, not on your host. `PORTS=...` only publishes ports of the pod itself, so it does not make an inner service reachable from the host. From inside the pod, reach it at `dind:<published-port>` (e.g. `curl http://dind:8080`); to open it from the host browser, run a small proxy in the pod that listens on a `PORTS` port and forwards to `dind:<port>`, or run the dev server in the pod instead. This is not a security boundary: on native Linux the sidecar's bridge network is routable from the host, so a port an inner container publishes on all interfaces can still be reached from the host via the sidecar's bridge IP. Bind such ports to `127.0.0.1` inside the sidecar (`-p 127.0.0.1:8080:80`) if that matters.
+- To cancel a `DOCKER=1` launcher that a script started in the background (`claude-pod ... &`), send it SIGTERM (`kill $!`), not SIGINT: non-interactive shells start background jobs with SIGINT ignored, and Bash can't override that. Ctrl-C in a terminal and SIGINT from an interactive shell work. Either signal stops the pod first and then removes the sidecar, network and certificate volume.
+- `DOCKER=1` and `NET=none` are mutually exclusive. `MEMORY`, `CPUS` and `PIDS` apply to the sidecar too. Set `DIND_IMAGE=...` to use a different sidecar image (pin it by digest).
+- Changing this feature? See [docs/docker-sidecar.md](docs/docker-sidecar.md) for the design, the lifecycle invariants and how to test it.
+- Images are re-pulled every session by default. See [Keeping images between sessions](#keeping-images-between-sessions) to reuse them.
+
+#### Keeping images between sessions
+
+Add `DOCKER_CACHE=1` to keep the sidecar's images, layers and volumes between sessions, so nothing is re-pulled or rebuilt:
+
+```sh
+DOCKER=1 DOCKER_CACHE=1 claude-pod
+```
+
+- The data lives in a Docker named volume `claude-pod-docker-<SHA-256 of the project path, first 16 hex characters>`, one per project. It is not a host folder: overlay storage doesn't work on macOS/Windows file shares, and the directory has to be owned by the sidecar's uid 1000.
+- On startup you'll see either `Docker cache: created new ...` or `Docker cache: reusing ... (N images, SIZE)`, so you can tell at a glance whether the cache is working.
+- Only one session per project can use the cache at a time; a second one stops with a message. Run it without `DOCKER_CACHE=1` for a throwaway daemon alongside.
+- **Security trade-off:** whatever a session pulled or built, including anything malicious or secret, is still there in the next one. Skip it for untrusted code.
+- Caches that haven't been used for 90 days are removed automatically the next time any project starts with `DOCKER_CACHE=1`. Change the limit with `DOCKER_CACHE_MAX_AGE_DAYS=30`, or disable it with `DOCKER_CACHE_MAX_AGE_DAYS=0`. Docker doesn't track volume usage itself, so each cache gets an empty marker file whose modification time is its last use, in `~/.local/state/claude-pod/caches/` (or under `$XDG_STATE_HOME`). That is deliberately outside `~/.claude-pod/`, so the pod can't see or alter it.
+- Otherwise the cache grows until you clean it. Inspect with `docker volume ls --filter name=claude-pod-docker-`, delete one with `docker volume rm <name>`; `uninstall.sh` removes them all.
 
 ### Pasting images and screenshots
 
@@ -258,7 +343,7 @@ If a platform doesn't behave as expected, please open an issue.
 ~/tools/claude-pod/uninstall.sh
 ```
 
-Removes `~/.claude-pod/` and the `claude-pod` image after confirmation. Tells you exactly what it isn't touching (`node:24-slim`, build cache, this repo) and how to clean those up yourself.
+Removes `~/.claude-pod/`, the `claude-pod` image and any `DOCKER_CACHE` volumes after confirmation. Tells you exactly what it isn't touching (`node:24-slim`, build cache, this repo) and how to clean those up yourself.
 
 If you added a shell alias for convenience (e.g. `alias claude-pod=...` in `~/.zshrc` / `~/.bashrc`), remove that line too — `uninstall.sh` doesn't touch your shell rc files.
 
