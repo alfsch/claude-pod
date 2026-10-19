@@ -97,8 +97,12 @@ launch() {   # launch <env VAR=...>... -- args   (foreground; sets RC)
 }
 launch_bg() { # same, background; sets LPID
   local envs=(); while [ "$1" != -- ]; do envs+=("$1"); shift; done; shift
+  # Job control (set -m) gives the background launcher default signal dispositions; without it a non-interactive
+  # shell starts async commands with SIGINT ignored, and bash cannot trap a signal that was ignored on entry.
+  set -m
   (launch_env exec env "${envs[@]}" "$LAUNCHER" "$@" </dev/null >"$CASE/out" 2>"$CASE/err") &
   LPID=$!
+  set +m
   ( sleep 45; kill -9 "$LPID" 2>/dev/null ) & WD=$!
 }
 finish_bg() { RC=0; wait "$LPID" || RC=$?; kill "$WD" 2>/dev/null; wait "$WD" 2>/dev/null; return 0; }
@@ -207,6 +211,20 @@ test_term_running() {   # SIGTERM while the pod runs: pod is stopped first, its 
   wait_for "$STUB_DIR/pod-running"; kill -TERM "$LPID"; finish_bg
   rc_is 143; order '^stop -t 10 claude-pod-run-' '^rm -f claude-pod-run-' '^rm -f -v sidecarid' '^network rm' '^volume rm claude-pod-certs-'
 }
+test_int_hup_startup() {   # INT/HUP while the sidecar starts: 130/129, everything removed
+  local sig code; for sig in INT:130 HUP:129; do code=${sig#*:}; sig=${sig%:*}
+    setup_case; launch_bg DOCKER=1 STUB_READY_AFTER=1000 -- true
+    wait_for "$STUB_DIR/sidecar"; sleep 1; kill -"$sig" "$LPID"; finish_bg
+    rc_is "$code"; not_logged '^run --rm'; order '^rm -f -v sidecarid' '^network rm' '^volume rm claude-pod-certs-'
+  done
+}
+test_int_hup_running() {   # INT/HUP while the pod runs: pod stopped first, then cleanup (same path as SIGTERM)
+  local sig; for sig in INT HUP; do
+    setup_case; launch_bg DOCKER=1 STUB_POD_SLEEP=60 -- sleep 60
+    wait_for "$STUB_DIR/pod-running"; kill -"$sig" "$LPID"; finish_bg
+    rc_is 143; order '^stop -t 10 claude-pod-run-' '^rm -f -v sidecarid' '^network rm' '^volume rm claude-pod-certs-'
+  done
+}
 test_stop_signal() {   # only the default (interactive) shell is stopped with SIGHUP; see the comment in the launcher
   setup_case; launch DOCKER=1 --
   rc_is 0; logged '^run --rm .*--init --stop-signal=SIGHUP '
@@ -260,6 +278,9 @@ run_mutants() {
   mutate test_term_during_pod_creation $'  [ -z "$STOP_REQUESTED" ] || stop_pod\n' '' || rc=1
   mutate test_term_before_pod_pid 'STOP_REQUESTED=1; docker stop' 'docker stop' || rc=1
   mutate test_term_running  'trap stop_pod TERM INT HUP' 'trap "" TERM INT HUP' || rc=1
+  mutate test_int_hup_running 'trap stop_pod TERM INT HUP' 'trap stop_pod TERM' || rc=1
+  mutate test_int_hup_startup "trap 'exit 130' INT" "trap 'exit 1' INT" || rc=1
+  mutate test_int_hup_startup "trap 'exit 129' HUP" "trap 'exit 1' HUP" || rc=1
   return $rc
 }
 

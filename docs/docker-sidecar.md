@@ -104,7 +104,9 @@ conflict, dead sidecar, `volume rm` results, failing `volume ls`). Override `HOM
 and set `CLAUDE_POD_NO_UPDATE=1`. Make each test discriminating: copy the launcher without the fix
 (`sed '/line/d'`) and check that the test fails there. Covered this way: command sequence, exit-code
 propagation, cache create/reuse/prune (old, young, in-use, missing stamps, paths with spaces),
-exclusivity conflict, startup and double signals, early sidecar exit.
+exclusivity conflict, TERM/INT/HUP during startup and while the pod runs, a second signal during
+cleanup, a stop during pod creation, early sidecar exit. The INT tests start the launcher with `set -m`:
+a background job of a non-interactive shell otherwise has SIGINT ignored.
 
 **Real Docker checklist** (run from a project folder; replace the alias with the full path to
 `claude-pod` inside `bash -c`):
@@ -120,6 +122,10 @@ DOCKER=1 claude-pod sleep 60 </dev/null & p=$!; sleep 30; kill -INT $p; wait $p 
 bash -c 'DOCKER=1 /path/to/claude-pod sleep 60 </dev/null & p=$!; sleep 30; kill -TERM $p; wait $p'
 docker ps -a --filter name=claude-pod; docker network ls --filter name=claude-pod; \
   docker volume ls --filter name=claude-pod                       # only the cache volume may remain
+# TLS must refuse everything without the pod's credentials. While a session runs, from a second container on
+# its network (claude-pod-net-<id>, certs in claude-pod-certs-<id>), each of these must fail: plain TCP to
+# 2376 ("HTTP request to an HTTPS server"), TLS without a client cert, TLS with a client cert from another CA
+# ("certificate required"), plain TCP to 2375. With --tlscacert/--tlscert/--tlskey from the certs volume it works.
 ```
 
 Which of these checks have been run, where, and what is still open is tracked in the pull request description,
