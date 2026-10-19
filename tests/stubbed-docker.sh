@@ -14,6 +14,8 @@ LAUNCHER="${LAUNCHER:-$ROOT/claude-pod}"
 # The stub logs every call ("$*") and is steered by STUB_* variables:
 #   STUB_POD_EXIT=N       exit code of the pod (default 0)
 #   STUB_POD_SLEEP=N      the pod runs N seconds or until `docker stop <pod>` (then exits 143)
+#   STUB_POD_CREATE_DELAY=N  the pod is "created but not started" for N seconds first; like real Docker,
+#                         `docker stop` then succeeds and does nothing (measured: rc 0, state stays created)
 #   STUB_NAME_CONFLICT=1  `docker run -d` fails like a taken container name
 #   STUB_SIDECAR_DEAD=1   sidecar never becomes ready and is reported as exited, with a rootlesskit log
 #   STUB_READY_AFTER=N    sidecar becomes ready after N failed `exec` probes (1000 = never)
@@ -47,8 +49,10 @@ case "$1" in
       : > "$STUB_DIR/sidecar"; echo sidecarid; exit 0
     fi
     if [ -n "${STUB_POD_SLEEP:-}" ]; then
-      sleep "$STUB_POD_SLEEP" & s=$!; echo $$ > "$STUB_DIR/pod.pid"
+      : > "$STUB_DIR/pod-created"; sleep "${STUB_POD_CREATE_DELAY:-0}"
+      sleep "$STUB_POD_SLEEP" & s=$!
       trap 'kill $s 2>/dev/null; exit 143' TERM
+      echo $$ > "$STUB_DIR/pod.pid"
       echo started > "$STUB_DIR/pod-running"
       wait $s
     fi
@@ -64,7 +68,10 @@ case "$1" in
   stop)
     # Stopping the pod ends the stub pod; its own exit code (143) is what the launcher must report.
     if [[ "$*" == *claude-pod-run-* ]]; then
-      [ -f "$STUB_DIR/pod.pid" ] || { echo 'Error response from daemon: No such container' >&2; exit 1; }
+      if [ ! -f "$STUB_DIR/pod.pid" ]; then
+        [ -f "$STUB_DIR/pod-created" ] && exit 0   # created, not started: succeeds and does nothing
+        echo 'Error response from daemon: No such container' >&2; exit 1
+      fi
       kill -TERM "$(cat "$STUB_DIR/pod.pid")" 2>/dev/null
     fi
     exit 0 ;;
@@ -211,6 +218,11 @@ test_stop_signal() {   # only the default (interactive) shell is stopped with SI
   done
   setup_case; launch -- ; rc_is 0; not_logged 'stop-signal'   # plain path unchanged (invariant 7)
 }
+test_term_during_pod_creation() {   # a stop that hits the created-but-not-started pod is a no-op in Docker: retry it
+  setup_case; launch_bg DOCKER=1 STUB_POD_SLEEP=8 STUB_POD_CREATE_DELAY=3 -- sleep 8
+  wait_for "$STUB_DIR/pod-created"; kill -TERM "$LPID"; finish_bg
+  rc_is 143; order '^stop -t 10 claude-pod-run-' '^rm -f -v sidecarid' '^network rm'
+}
 test_term_before_pod_pid() {   # a stop request in the gap before POD_PID is known must not be lost
   setup_case
   # The gap is microseconds wide, so inject the signal into a copy of the launcher right before the pod starts.
@@ -244,7 +256,9 @@ run_mutants() {
   mutate test_stop_signal   'STOP_FLAGS=(--stop-signal=SIGHUP)' 'STOP_FLAGS=()' || rc=1
   mutate test_stop_signal   '[ "$#" -eq 0 ] || {' 'true || {' || rc=1
   mutate test_stop_signal   '[ "$#" -eq 1 ] && [ "$1" = bash ]' '[ "$1" = bash ]' || rc=1
-  mutate test_term_before_pod_pid $'POD_PID=$!\n[ -z "$STOP_REQUESTED" ] || stop_pod\n' $'POD_PID=$!\n' || rc=1
+  mutate test_term_before_pod_pid $'  [ -z "$STOP_REQUESTED" ] || stop_pod\n' '' || rc=1
+  mutate test_term_during_pod_creation $'  [ -z "$STOP_REQUESTED" ] || stop_pod\n' '' || rc=1
+  mutate test_term_before_pod_pid 'STOP_REQUESTED=1; docker stop' 'docker stop' || rc=1
   mutate test_term_running  'trap stop_pod TERM INT HUP' 'trap "" TERM INT HUP' || rc=1
   return $rc
 }

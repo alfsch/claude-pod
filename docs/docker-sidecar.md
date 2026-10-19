@@ -36,8 +36,11 @@ host Docker  ──runs──▶  pod (claude-pod image)         cap-drop=ALL, n
 5. The pod runs in the background and the launcher polls `kill -0` before a single `wait`, so the
    pod's exit status is never confused with a signal-interrupted `wait` (128+N). Startup traps are
    `exit 143/130/129`; once the pod runs, the trap is `stop_pod` (`docker stop`, or kill the client if
-   the pod does not exist yet). A stop request that lands before `POD_PID` is known is remembered in
-   `STOP_REQUESTED` and applied right after the pod is started.
+   the pod does not exist yet). A stop request is remembered in `STOP_REQUESTED` and the poll loop
+   repeats `docker stop` until the pod is gone. Two windows need that: before `POD_PID` is known, and
+   between Docker creating the pod container and starting it, where `docker stop` succeeds without
+   effect (measured: rc 0, state stays `created`, the waiting `docker run` then starts it anyway; 15/15
+   stops lost without the retry, 0/15 with it).
 6. The pod gets `--init` (only with `DOCKER=1`): with a bare shell or node as PID 1 the stop signal is
    ignored and the pod dies only after the 10s grace period (exit 137). `--init` is not enough for the
    default command: interactive Bash (TTY) ignores SIGTERM even as a child of tini (measured with
