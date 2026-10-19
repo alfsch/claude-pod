@@ -122,6 +122,5 @@ docker ps -a --filter name=claude-pod; docker network ls --filter name=claude-po
   docker volume ls --filter name=claude-pod                       # only the cache volume may remain
 ```
 
-Status: ported from copilot-pod, where everything above was verified on native Linux. For claude-pod only
-`bash -n` has been run so far; the stubbed-`docker` tests and the real-Docker checklist above still have to be
-repeated here. Current status and open items are tracked in the pull request description.
+Which of these checks have been run, where, and what is still open is tracked in the pull request description,
+not here, so it cannot go stale.
