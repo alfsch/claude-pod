@@ -48,6 +48,11 @@ host Docker  ──runs──▶  pod (claude-pod image)         cap-drop=ALL, n
    no command is given, or it is a plain `bash`, the pod also gets `--stop-signal=SIGHUP` and reports 129;
    other commands (including `bash -c ...`, which is not interactive) keep SIGTERM and report 143. Not in the Dockerfile (`STOPSIGNAL`) on purpose: that would change the signal
    for `claude` and every other command too.
+   The sidecar gets `--init` too, for the same reason at another time: its image entrypoint is a shell that
+   runs as PID 1 and generates the TLS certificates before it execs dockerd, and a PID 1 without a handler
+   ignores SIGTERM, so a signal during startup cost the whole 10s stop timeout (exit 137). Measured with
+   `docker stop -t 10` 0.5s after start: 10.3s without `--init`, 0.2s with; a stop of a ready sidecar is
+   1.3s either way (graceful, exit 0). Launcher abort during startup: ~11s before, 1-2s now.
 7. Without `DOCKER=1` the launcher still `exec`s docker, exactly as before.
 
 ## Cache design
@@ -121,7 +126,7 @@ DOCKER=1 DOCKER_CACHE=1 claude-pod true                           # must be reje
 # Signals. Startup (sidecar + pod) takes several seconds, so the signal must land once the pod runs: wait
 # for that (sleep 30 is a generous guess), then time `wait`. Expect 143, 2-3s after the signal (pod stop
 # 0.4s, sidecar stop 1.3s, the rest are docker calls). A signal DURING startup is a different path: exit
-# 130 (INT), 129 (HUP) or 143 (TERM) and ~10s, because the half-started sidecar ignores SIGTERM until its entrypoint hands over.
+# 130 (INT), 129 (HUP) or 143 (TERM) and 1-2s (the sidecar runs under --init, see invariant 6).
 DOCKER=1 claude-pod sleep 60 </dev/null & p=$!; sleep 30; s=$SECONDS; kill -INT $p; wait $p; echo "exit=$? $((SECONDS-s))s"
 bash -c 'DOCKER=1 /path/to/claude-pod sleep 60 </dev/null & p=$!; sleep 30; kill -TERM $p; wait $p'
 docker ps -a --filter name=claude-pod; docker network ls --filter name=claude-pod; \

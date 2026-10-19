@@ -273,8 +273,11 @@ if [ -n "${DOCKER:-}" ]; then
     DIND_DATA_FLAGS=(-v "$DIND_CACHE_VOL:/home/rootless/.local/share/docker")
   fi
   # No --rm: a sidecar that dies during startup must still exist so its logs can be shown below;
-  # cleanup_dind removes it.
-  docker run -d --privileged \
+  # cleanup_dind removes it. --init: the image's entrypoint is a shell that runs as PID 1 and generates the
+  # TLS certificates before it execs dockerd; a PID 1 without a handler ignores SIGTERM, so an abort during
+  # startup would wait out the whole 10s stop timeout (exit 137). With tini as PID 1 the shell stops at once;
+  # after the exec, dockerd gets the signal and shuts down gracefully as before.
+  docker run -d --privileged --init \
     --name "$DIND_NAME" --label "claude-pod.run=$RUN_ID" --network "$DIND_NET" --network-alias dind \
     --pids-limit="${PIDS:-4096}" \
     ${MEMORY:+--memory="$MEMORY"} ${CPUS:+--cpus="$CPUS"} \

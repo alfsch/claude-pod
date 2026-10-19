@@ -128,7 +128,7 @@ test_plain_exec() {   # without DOCKER=1 the launcher only execs docker run (inv
 test_sequence() {   # DOCKER=1: command order, run-id consistency, exit code, cleanup
   setup_case; launch DOCKER=1 STUB_POD_EXIT=7 -- true
   rc_is 7
-  order '^network create claude-pod-net-' '^volume create claude-pod-certs-' '^run -d --privileged --name claude-pod-dind-' \
+  order '^network create claude-pod-net-' '^volume create claude-pod-certs-' '^run -d --privileged --init --name claude-pod-dind-' \
         '^exec -e DOCKER_HOST=tcp://localhost:2376' '^run --rm .*--name claude-pod-run-' \
         '^rm -f claude-pod-run-' '^ps -aq --filter label=claude-pod.run=' '^stop -t 10 sidecarid' '^rm -f -v sidecarid' \
         '^network rm claude-pod-net-' '^volume rm claude-pod-certs-'
@@ -150,7 +150,7 @@ test_cache_new() {   # new cache volume, fixed sidecar name, stamp
   setup_case; launch DOCKER=1 DOCKER_CACHE=1 -- true
   rc_is 0
   in_out "created new claude-pod-docker-$HASH"
-  logged "^run -d --privileged --name claude-pod-dind-cache-$HASH "
+  logged "^run -d --privileged --init --name claude-pod-dind-cache-$HASH "
   logged " -v claude-pod-docker-$HASH:/home/rootless/.local/share/docker "
   [ -f "$STATE/claude-pod-docker-$HASH" ] || fail "stamp file missing"
   not_logged 'volume rm claude-pod-docker-'
@@ -265,6 +265,7 @@ mutate() {   # mutate <test> <old> <new>   (literal replacement in a copy of the
 run_mutants() {
   local rc=0
   mutate test_sequence      $'  ${DOCKER:+--init} \\\n' '' || rc=1
+  mutate test_sequence      'docker run -d --privileged --init \' 'docker run -d --privileged \' || rc=1
   mutate test_sequence      $'  docker network rm "$DIND_NET" >/dev/null 2>&1 || true\n' '' || rc=1
   mutate test_option_validation 'die "$_v must be 1 (or unset), not '"'"'${!_v}'"'"'."' 'true' || rc=1
   mutate test_cache_new     'DIND_NAME="claude-pod-dind-cache-$_hash"' 'DIND_NAME="claude-pod-dind-$RUN_ID"' || rc=1
