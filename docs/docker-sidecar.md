@@ -118,7 +118,11 @@ DOCKER=1 DOCKER_CACHE=1 claude-pod docker pull hello-world        # then:
 DOCKER=1 DOCKER_CACHE=1 claude-pod docker images                  # "reusing ... (1 images ...)"
 DOCKER=1 DOCKER_CACHE=1 claude-pod sleep 60                       # 2nd terminal, same folder:
 DOCKER=1 DOCKER_CACHE=1 claude-pod true                           # must be rejected
-DOCKER=1 claude-pod sleep 60 </dev/null & p=$!; sleep 30; kill -INT $p; wait $p   # 143 after ~2s
+# Signals. Startup (sidecar + pod) takes several seconds, so the signal must land once the pod runs: wait
+# for that (sleep 30 is a generous guess), then time `wait`. Expect 143, 2-3s after the signal (pod stop
+# 0.4s, sidecar stop 1.3s, the rest are docker calls). A signal DURING startup is a different path: exit
+# 130 (INT), 129 (HUP) or 143 (TERM) and ~10s, because the half-started sidecar ignores SIGTERM until its entrypoint hands over.
+DOCKER=1 claude-pod sleep 60 </dev/null & p=$!; sleep 30; s=$SECONDS; kill -INT $p; wait $p; echo "exit=$? $((SECONDS-s))s"
 bash -c 'DOCKER=1 /path/to/claude-pod sleep 60 </dev/null & p=$!; sleep 30; kill -TERM $p; wait $p'
 docker ps -a --filter name=claude-pod; docker network ls --filter name=claude-pod; \
   docker volume ls --filter name=claude-pod                       # only the cache volume may remain
