@@ -330,9 +330,15 @@ fi
 # work (the unprivileged runtime user has no write access to the root-owned npm prefix, so it only prints
 # "Auto-update failed"), and updates are handled by rebuilding the image instead: the start-up check
 # above for the stable channel, or install.sh for a pinned version.
+# Interactive Bash (the default command) ignores SIGTERM even under --init, so `docker stop` would wait
+# out the 10s grace period and end in exit 137. SIGHUP makes it exit at once (status 129). Only the
+# default shell gets it: explicit commands keep the image's stop signal (SIGTERM).
+STOP_FLAGS=()
+if [ -n "${DOCKER:-}" ] && [ "$#" -eq 0 ]; then STOP_FLAGS=(--stop-signal=SIGHUP); fi
 RUN_CMD=(docker run "${DOCKER_FLAGS[@]}" \
   ${DOCKER:+--name "$POD_NAME"} \
   ${DOCKER:+--init} \
+  ${STOP_FLAGS[@]+"${STOP_FLAGS[@]}"} \
   --cap-drop=ALL \
   --security-opt=no-new-privileges \
   --user "$(id -u):$(id -g)" \

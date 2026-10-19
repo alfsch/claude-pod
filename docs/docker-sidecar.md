@@ -39,7 +39,12 @@ host Docker  ──runs──▶  pod (claude-pod image)         cap-drop=ALL, n
    the pod does not exist yet). A stop request that lands before `POD_PID` is known is remembered in
    `STOP_REQUESTED` and applied right after the pod is started.
 6. The pod gets `--init` (only with `DOCKER=1`): with a bare shell or node as PID 1 the stop signal is
-   ignored and the pod dies only after the 10s grace period (exit 137).
+   ignored and the pod dies only after the 10s grace period (exit 137). `--init` is not enough for the
+   default command: interactive Bash (TTY) ignores SIGTERM even as a child of tini (measured with
+   `docker stop -t 10`: SIGTERM takes 10s and ends in 137, SIGHUP takes under 1s and ends in 129). So when
+   no command is given the pod also gets `--stop-signal=SIGHUP` and reports 129; explicit commands keep
+   SIGTERM and report 143. Not in the Dockerfile (`STOPSIGNAL`) on purpose: that would change the signal
+   for `claude` and every other command too.
 7. Without `DOCKER=1` the launcher still `exec`s docker, exactly as before.
 
 ## Cache design
