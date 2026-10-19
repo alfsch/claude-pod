@@ -13,7 +13,7 @@ LAUNCHER="${LAUNCHER:-$ROOT/claude-pod}"
 
 # The stub logs every call ("$*") and is steered by STUB_* variables:
 #   STUB_POD_EXIT=N       exit code of the pod (default 0)
-#   STUB_POD_SLEEP=1      the pod runs until `docker stop <pod>` (then exits 143)
+#   STUB_POD_SLEEP=N      the pod runs N seconds or until `docker stop <pod>` (then exits 143)
 #   STUB_NAME_CONFLICT=1  `docker run -d` fails like a taken container name
 #   STUB_SIDECAR_DEAD=1   sidecar never becomes ready and is reported as exited, with a rootlesskit log
 #   STUB_READY_AFTER=N    sidecar becomes ready after N failed `exec` probes (1000 = never)
@@ -47,7 +47,7 @@ case "$1" in
       : > "$STUB_DIR/sidecar"; echo sidecarid; exit 0
     fi
     if [ -n "${STUB_POD_SLEEP:-}" ]; then
-      sleep 60 & s=$!; echo $$ > "$STUB_DIR/pod.pid"
+      sleep "$STUB_POD_SLEEP" & s=$!; echo $$ > "$STUB_DIR/pod.pid"
       trap 'kill $s 2>/dev/null; exit 143' TERM
       echo started > "$STUB_DIR/pod-running"
       wait $s
@@ -63,7 +63,10 @@ case "$1" in
   ps) [ ! -e "$STUB_DIR/sidecar" ] || echo sidecarid; exit 0 ;;
   stop)
     # Stopping the pod ends the stub pod; its own exit code (143) is what the launcher must report.
-    [[ "$*" == *claude-pod-run-* ]] && [ -f "$STUB_DIR/pod.pid" ] && kill -TERM "$(cat "$STUB_DIR/pod.pid")" 2>/dev/null
+    if [[ "$*" == *claude-pod-run-* ]]; then
+      [ -f "$STUB_DIR/pod.pid" ] || { echo 'Error response from daemon: No such container' >&2; exit 1; }
+      kill -TERM "$(cat "$STUB_DIR/pod.pid")" 2>/dev/null
+    fi
     exit 0 ;;
   *) exit 0 ;;
 esac
@@ -193,9 +196,19 @@ test_double_term_startup() {   # a second SIGTERM during cleanup must not cut it
   logged '^volume rm claude-pod-certs-'
 }
 test_term_running() {   # SIGTERM while the pod runs: pod is stopped first, its status (143) is reported, then cleanup
-  setup_case; launch_bg DOCKER=1 STUB_POD_SLEEP=1 -- sleep 60
+  setup_case; launch_bg DOCKER=1 STUB_POD_SLEEP=60 -- sleep 60
   wait_for "$STUB_DIR/pod-running"; kill -TERM "$LPID"; finish_bg
   rc_is 143; order '^stop -t 10 claude-pod-run-' '^rm -f claude-pod-run-' '^rm -f -v sidecarid' '^network rm' '^volume rm claude-pod-certs-'
+}
+test_term_before_pod_pid() {   # a stop request in the gap before POD_PID is known must not be lost
+  setup_case
+  # The gap is microseconds wide, so inject the signal into a copy of the launcher right before the pod starts.
+  local src hook; src="$(cat "$LAUNCHER"; echo x)"; src="${src%x}"
+  hook=$'"${RUN_CMD[@]}" <&0 &\n'
+  [[ "$src" == *"$hook"* ]] || fail "launcher layout changed: pod start line not found"
+  printf '%s%s%s%s' "${src%%"$hook"*}" 'kill -TERM $$'$'\n' "$hook" "${src#*"$hook"}" > "$CASE/injected"; chmod +x "$CASE/injected"
+  LAUNCHER="$CASE/injected" launch_bg DOCKER=1 STUB_POD_SLEEP=8 -- sleep 8; finish_bg
+  rc_is 143; order '^stop -t 10 claude-pod-run-' '^rm -f -v sidecarid' '^network rm'
 }
 
 # ---- mutants: each must make its test fail, proving the test discriminates -----------------------------
@@ -217,6 +230,7 @@ run_mutants() {
   mutate test_prune         '-mmin +$(( max_days * 1440 ))' '-mmin +0' || rc=1
   mutate test_prune         'elif grep -qi '"'"'no such volume'"'"' <<<"$out"; then' 'elif false; then' || rc=1
   mutate test_double_term_startup $'  trap \'\' INT TERM HUP\n' '' || rc=1
+  mutate test_term_before_pod_pid $'POD_PID=$!\n[ -z "$STOP_REQUESTED" ] || stop_pod\n' $'POD_PID=$!\n' || rc=1
   mutate test_term_running  'trap stop_pod TERM INT HUP' 'trap "" TERM INT HUP' || rc=1
   return $rc
 }

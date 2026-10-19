@@ -36,7 +36,8 @@ host Docker  ──runs──▶  pod (claude-pod image)         cap-drop=ALL, n
 5. The pod runs in the background and the launcher polls `kill -0` before a single `wait`, so the
    pod's exit status is never confused with a signal-interrupted `wait` (128+N). Startup traps are
    `exit 143/130/129`; once the pod runs, the trap is `stop_pod` (`docker stop`, or kill the client if
-   the pod does not exist yet).
+   the pod does not exist yet). A stop request that lands before `POD_PID` is known is remembered in
+   `STOP_REQUESTED` and applied right after the pod is started.
 6. The pod gets `--init` (only with `DOCKER=1`): with a bare shell or node as PID 1 the stop signal is
    ignored and the pod dies only after the 10s grace period (exit 137).
 7. Without `DOCKER=1` the launcher still `exec`s docker, exactly as before.

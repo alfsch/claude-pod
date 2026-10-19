@@ -355,12 +355,14 @@ RUN_CMD=(docker run "${DOCKER_FLAGS[@]}" \
 if [ -z "${DOCKER:-}" ]; then
   exec "${RUN_CMD[@]}"
 fi
-POD_PID=
-stop_pod() { docker stop -t 10 "$POD_NAME" >/dev/null 2>&1 || kill "$POD_PID" 2>/dev/null || true; }
+POD_PID=; STOP_REQUESTED=
+# A request that arrives before POD_PID is known (pod not started yet) is remembered and applied below.
+stop_pod() { STOP_REQUESTED=1; docker stop -t 10 "$POD_NAME" >/dev/null 2>&1 || { [ -z "$POD_PID" ] || kill "$POD_PID" 2>/dev/null; } || true; }
 trap stop_pod TERM INT HUP
 set +e
 "${RUN_CMD[@]}" <&0 &
 POD_PID=$!
+[ -z "$STOP_REQUESTED" ] || stop_pod
 while kill -0 "$POD_PID" 2>/dev/null; do sleep 0.2; done
 wait "$POD_PID"
 exit $?
