@@ -332,9 +332,12 @@ fi
 # above for the stable channel, or install.sh for a pinned version.
 # Interactive Bash (the default command) ignores SIGTERM even under --init, so `docker stop` would wait
 # out the 10s grace period and end in exit 137. SIGHUP makes it exit at once (status 129). Only the
-# default shell gets it: explicit commands keep the image's stop signal (SIGTERM).
+# default shell (no command, or a plain `bash`) gets it: other commands, including `bash -c ...`, keep the
+# image's stop signal (SIGTERM).
 STOP_FLAGS=()
-if [ -n "${DOCKER:-}" ] && [ "$#" -eq 0 ]; then STOP_FLAGS=(--stop-signal=SIGHUP); fi
+if [ -n "${DOCKER:-}" ] && { [ "$#" -eq 0 ] || { [ "$#" -eq 1 ] && [ "$1" = bash ]; }; }; then
+  STOP_FLAGS=(--stop-signal=SIGHUP)
+fi
 RUN_CMD=(docker run "${DOCKER_FLAGS[@]}" \
   ${DOCKER:+--name "$POD_NAME"} \
   ${DOCKER:+--init} \

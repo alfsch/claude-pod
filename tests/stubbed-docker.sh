@@ -203,8 +203,12 @@ test_term_running() {   # SIGTERM while the pod runs: pod is stopped first, its 
 test_stop_signal() {   # only the default (interactive) shell is stopped with SIGHUP; see the comment in the launcher
   setup_case; launch DOCKER=1 --
   rc_is 0; logged '^run --rm .*--init --stop-signal=SIGHUP '
-  setup_case; launch DOCKER=1 -- true
-  rc_is 0; not_logged 'stop-signal'
+  setup_case; launch DOCKER=1 -- bash
+  rc_is 0; logged '^run --rm .*--init --stop-signal=SIGHUP .* claude-pod bash$'
+  local c; for c in "true" "bash -c true" "bash script.sh" "claude --version"; do
+    setup_case; launch DOCKER=1 -- $c
+    rc_is 0; not_logged 'stop-signal'
+  done
   setup_case; launch -- ; rc_is 0; not_logged 'stop-signal'   # plain path unchanged (invariant 7)
 }
 test_term_before_pod_pid() {   # a stop request in the gap before POD_PID is known must not be lost
@@ -238,7 +242,8 @@ run_mutants() {
   mutate test_prune         'elif grep -qi '"'"'no such volume'"'"' <<<"$out"; then' 'elif false; then' || rc=1
   mutate test_double_term_startup $'  trap \'\' INT TERM HUP\n' '' || rc=1
   mutate test_stop_signal   'STOP_FLAGS=(--stop-signal=SIGHUP)' 'STOP_FLAGS=()' || rc=1
-  mutate test_stop_signal   '[ "$#" -eq 0 ]' 'true' || rc=1
+  mutate test_stop_signal   '[ "$#" -eq 0 ] || {' 'true || {' || rc=1
+  mutate test_stop_signal   '[ "$#" -eq 1 ] && [ "$1" = bash ]' '[ "$1" = bash ]' || rc=1
   mutate test_term_before_pod_pid $'POD_PID=$!\n[ -z "$STOP_REQUESTED" ] || stop_pod\n' $'POD_PID=$!\n' || rc=1
   mutate test_term_running  'trap stop_pod TERM INT HUP' 'trap "" TERM INT HUP' || rc=1
   return $rc
