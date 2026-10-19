@@ -204,7 +204,7 @@ prune_dind_caches() {
     if out="$(docker volume rm "$name" 2>&1)"; then
       rm -f "$stamp"
       printf '%s●%s Removed Docker cache %s (unused for over %s days)\n' "$BOLD" "$RESET" "$name" "$max_days" >&2
-    elif [[ "$out" == *"No such volume"* ]]; then
+    elif grep -qi 'no such volume' <<<"$out"; then
       rm -f "$stamp"   # already gone (deleted by hand)
     fi
   done < <(find "$STATE_DIR" -type f -mmin +$(( max_days * 1440 )) -print0 2>/dev/null)

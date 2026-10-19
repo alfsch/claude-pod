@@ -85,9 +85,11 @@ section "Requirements for DOCKER=1" (sysctl.d setting and how to undo it). For t
 
 ## Testing
 
-There is no automated test suite. Two layers have been used:
+There is no CI. Two layers have been used:
 
-**Stubbed `docker`** (no daemon needed). Put a fake `docker` script first on `PATH` that logs every call
+**Stubbed `docker`** (no daemon needed): `tests/stubbed-docker.sh` runs the cases below and then a set of
+mutants (the launcher with one fix removed) that each must make a test fail. Run it after every launcher
+change; `tests/stubbed-docker.sh test_prune` runs a single test. Its description of the approach: Put a fake `docker` script first on `PATH` that logs every call
 and is steered by environment variables (pod exit code, long-running pod, slow sidecar start, name
 conflict, dead sidecar, `volume rm` results, failing `volume ls`). Override `HOME` and `XDG_STATE_HOME`
 and set `CLAUDE_POD_NO_UPDATE=1`. Make each test discriminating: copy the launcher without the fix

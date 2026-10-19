@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+# Tests for the claude-pod launcher against a stubbed `docker` (no daemon needed). See "Testing" in
+# docs/docker-sidecar.md. Usage: tests/stubbed-docker.sh [test-name ...]   (default: all tests + mutants)
+# Everything the daemon would do (rootless sidecar, TLS, real volumes, real signals through Docker) is
+# NOT covered here; use the real-Docker checklist in the docs for that.
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+T="$(mktemp -d)"
+trap 'rm -rf "$T"' EXIT
+BIN="$T/bin"; mkdir -p "$BIN"
+LAUNCHER="${LAUNCHER:-$ROOT/claude-pod}"
+
+# The stub logs every call ("$*") and is steered by STUB_* variables:
+#   STUB_POD_EXIT=N       exit code of the pod (default 0)
+#   STUB_POD_SLEEP=1      the pod runs until `docker stop <pod>` (then exits 143)
+#   STUB_NAME_CONFLICT=1  `docker run -d` fails like a taken container name
+#   STUB_SIDECAR_DEAD=1   sidecar never becomes ready and is reported as exited, with a rootlesskit log
+#   STUB_READY_AFTER=N    sidecar becomes ready after N failed `exec` probes (1000 = never)
+#   STUB_VOLUME_EXISTS=1  `volume inspect` succeeds (cache reuse)
+#   STUB_RM_INUSE / STUB_RM_MISSING   space-separated volume names for which `volume rm` fails
+#                         with the real Docker 28 wording ("volume is in use" / "no such volume")
+#   STUB_NETRM_SLEEP=N    `network rm` takes N seconds (widens the cleanup window for signals)
+cat >"$BIN/docker" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "$STUB_LOG"
+case "$1" in
+  info) exit 0 ;;
+  image) [ "$2" = ls ] && echo abc123; exit 0 ;;
+  network) [ "$2" = rm ] && sleep "${STUB_NETRM_SLEEP:-0}"; exit 0 ;;
+  volume)
+    case "$2" in
+      inspect) [ -n "${STUB_VOLUME_EXISTS:-}" ]; exit ;;
+      rm)
+        if [[ " ${STUB_RM_INUSE:-} " == *" $3 "* ]]; then
+          echo "Error response from daemon: remove $3: volume is in use - [7899c51c54fa]" >&2; exit 1
+        elif [[ " ${STUB_RM_MISSING:-} " == *" $3 "* ]]; then
+          echo "Error response from daemon: get $3: no such volume" >&2; exit 1
+        fi ;;
+    esac
+    exit 0 ;;
+  run)
+    if [ "$2" = -d ]; then
+      if [ -n "${STUB_NAME_CONFLICT:-}" ]; then
+        echo 'docker: Error response from daemon: Conflict. The container name is already in use.' >&2; exit 125
+      fi
+      : > "$STUB_DIR/sidecar"; echo sidecarid; exit 0
+    fi
+    if [ -n "${STUB_POD_SLEEP:-}" ]; then
+      sleep 60 & s=$!; echo $$ > "$STUB_DIR/pod.pid"
+      trap 'kill $s 2>/dev/null; exit 143' TERM
+      echo started > "$STUB_DIR/pod-running"
+      wait $s
+    fi
+    exit "${STUB_POD_EXIT:-0}" ;;
+  exec)
+    [[ "$*" == *"system df"* ]] && { echo 'Images|3|1.2GB'; exit 0; }
+    [ -z "${STUB_SIDECAR_DEAD:-}" ] || exit 1
+    n="$(cat "$STUB_DIR/probes" 2>/dev/null || echo 0)"; echo $((n + 1)) > "$STUB_DIR/probes"
+    [ "$n" -ge "${STUB_READY_AFTER:-0}" ]; exit ;;
+  inspect) [ -n "${STUB_SIDECAR_DEAD:-}" ] && echo false || echo true; exit 0 ;;
+  logs) [ -z "${STUB_SIDECAR_DEAD:-}" ] || echo '[rootlesskit:parent] error: fork/exec /proc/self/exe: operation not permitted'; exit 0 ;;
+  ps) [ ! -e "$STUB_DIR/sidecar" ] || echo sidecarid; exit 0 ;;
+  stop)
+    # Stopping the pod ends the stub pod; its own exit code (143) is what the launcher must report.
+    [[ "$*" == *claude-pod-run-* ]] && [ -f "$STUB_DIR/pod.pid" ] && kill -TERM "$(cat "$STUB_DIR/pod.pid")" 2>/dev/null
+    exit 0 ;;
+  *) exit 0 ;;
+esac
+STUB
+chmod +x "$BIN/docker"
+
+# ---- harness -------------------------------------------------------------------------------------------
+fail() { echo "    FAIL: $*" >&2; [ -f "$CASE/out" ] && sed 's/^/    out| /' "$CASE/out" >&2; [ -f "$CASE/err" ] && sed 's/^/    err| /' "$CASE/err" >&2; [ -f "$STUB_LOG" ] && sed 's/^/    log| /' "$STUB_LOG" >&2; exit 1; }
+setup_case() {
+  CASE="$(mktemp -d "$T/case.XXXXXX")"
+  PROJ="$CASE/my proj"; H="$CASE/home dir"          # spaces on purpose
+  STATE="$H/state/claude-pod/caches"
+  mkdir -p "$PROJ" "$H"
+  export STUB_LOG="$CASE/docker.log" STUB_DIR="$CASE/stub"; mkdir -p "$STUB_DIR"; : > "$STUB_LOG"
+  HASH="$(cd "$PROJ" && pwd -P | sha256sum | cut -c1-16)"
+}
+launch_env() { cd "$PROJ" && HOME="$H" XDG_STATE_HOME="$H/state" CLAUDE_POD_NO_UPDATE=1 PATH="$BIN:$PATH" "$@"; }
+launch() {   # launch <env VAR=...>... -- args   (foreground; sets RC)
+  local envs=(); while [ "$1" != -- ]; do envs+=("$1"); shift; done; shift
+  RC=0; (launch_env env "${envs[@]}" timeout 60 "$LAUNCHER" "$@" </dev/null >"$CASE/out" 2>"$CASE/err") || RC=$?
+}
+launch_bg() { # same, background; sets LPID
+  local envs=(); while [ "$1" != -- ]; do envs+=("$1"); shift; done; shift
+  (launch_env exec env "${envs[@]}" "$LAUNCHER" "$@" </dev/null >"$CASE/out" 2>"$CASE/err") &
+  LPID=$!
+  ( sleep 45; kill -9 "$LPID" 2>/dev/null ) & WD=$!
+}
+finish_bg() { RC=0; wait "$LPID" || RC=$?; kill "$WD" 2>/dev/null; wait "$WD" 2>/dev/null; return 0; }
+logged()    { grep -qE -- "$1" "$STUB_LOG" || fail "expected docker call matching: $1"; }
+not_logged(){ ! grep -qE -- "$1" "$STUB_LOG" || fail "unexpected docker call matching: $1"; }
+in_out()    { cat "$CASE/out" "$CASE/err" | grep -qE -- "$1" || fail "expected output matching: $1"; }
+rc_is()     { [ "$RC" = "$1" ] || fail "exit code $RC, expected $1"; }
+order() {    # order <regex>... : first match of each appears in this order
+  local last=0 n re; for re in "$@"; do
+    n="$(grep -nE -- "$re" "$STUB_LOG" | head -n1 | cut -d: -f1)"; [ -n "$n" ] || fail "missing docker call: $re"
+    [ "$n" -gt "$last" ] || fail "docker call out of order: $re"; last=$n; done
+}
+wait_for() { local i; for i in $(seq 1 100); do [ -e "$1" ] && return 0; sleep 0.1; done; fail "timed out waiting for $1"; }
+
+# ---- tests ---------------------------------------------------------------------------------------------
+test_plain_exec() {   # without DOCKER=1 the launcher only execs docker run (invariant 7)
+  setup_case; launch STUB_POD_EXIT=3 -- true
+  rc_is 3
+  [ "$(grep -c . "$STUB_LOG")" = 3 ] || fail "expected info, image ls and one run"
+  not_logged 'network|volume|--init|--privileged'
+  logged '^run --rm .*claude-pod true$'
+}
+test_sequence() {   # DOCKER=1: command order, run-id consistency, exit code, cleanup
+  setup_case; launch DOCKER=1 STUB_POD_EXIT=7 -- true
+  rc_is 7
+  order '^network create claude-pod-net-' '^volume create claude-pod-certs-' '^run -d --privileged --name claude-pod-dind-' \
+        '^exec -e DOCKER_HOST=tcp://localhost:2376' '^run --rm .*--name claude-pod-run-' \
+        '^rm -f claude-pod-run-' '^ps -aq --filter label=claude-pod.run=' '^stop -t 10 sidecarid' '^rm -f -v sidecarid' \
+        '^network rm claude-pod-net-' '^volume rm claude-pod-certs-'
+  logged '^run --rm .* --init '
+  logged '^run --rm .*--network=claude-pod-net-.*DOCKER_HOST=tcp://dind:2376.*DOCKER_TLS_VERIFY=1'
+  logged '^run --rm .*--cap-drop=ALL'
+  local net rmnet; net="$(sed -n 's/^network create //p' "$STUB_LOG")"; rmnet="$(sed -n 's/^network rm //p' "$STUB_LOG")"
+  [ -n "$net" ] && [ "$net" = "$rmnet" ] || fail "cleanup removed '$rmnet', run created '$net'"
+  [ "$(sed -n 's/.*label=claude-pod.run=//p' "$STUB_LOG" | head -n1)" = "${net#claude-pod-net-}" ] || fail "run id differs between resources"
+  not_logged 'volume rm claude-pod-docker-'
+}
+test_option_validation() {   # DOCKER=0 etc. must never start a sidecar
+  local c; for c in "DOCKER=0" "DOCKER=true" "DOCKER=1 DOCKER_CACHE=false" "DOCKER_CACHE=1" "DOCKER=1 NET=none"; do
+    setup_case; launch $c -- true
+    rc_is 1; not_logged '^(run|network|volume)'
+  done
+}
+test_cache_new() {   # new cache volume, fixed sidecar name, stamp
+  setup_case; launch DOCKER=1 DOCKER_CACHE=1 -- true
+  rc_is 0
+  in_out "created new claude-pod-docker-$HASH"
+  logged "^run -d --privileged --name claude-pod-dind-cache-$HASH "
+  logged " -v claude-pod-docker-$HASH:/home/rootless/.local/share/docker "
+  [ -f "$STATE/claude-pod-docker-$HASH" ] || fail "stamp file missing"
+  not_logged 'volume rm claude-pod-docker-'
+}
+test_cache_reuse() {
+  setup_case; launch DOCKER=1 DOCKER_CACHE=1 STUB_VOLUME_EXISTS=1 -- true
+  rc_is 0; in_out "reusing claude-pod-docker-$HASH \(3 images, 1.2GB\)"
+}
+test_cache_conflict() {   # name already taken: refuse, point at the leftover, touch nothing of the other session
+  setup_case; launch DOCKER=1 DOCKER_CACHE=1 STUB_NAME_CONFLICT=1 -- true
+  rc_is 1; in_out "docker rm -f claude-pod-dind-cache-$HASH"
+  not_logged '^run --rm'; not_logged '^(stop|rm -f -v)'
+  logged '^network rm '
+}
+test_prune() {   # old stamps pruned; young, in-use and foreign files kept; gone volumes lose only the stamp
+  setup_case; mkdir -p "$STATE"
+  local old=claude-pod-docker-aaaaaaaaaaaaaaaa young=claude-pod-docker-bbbbbbbbbbbbbbbb \
+        inuse=claude-pod-docker-cccccccccccccccc gone=claude-pod-docker-dddddddddddddddd
+  touch -d '3 days ago' "$STATE/$old" "$STATE/$inuse" "$STATE/$gone" "$STATE/not-a-cache" "$STATE/claude-pod-docker-short"
+  touch "$STATE/$young"
+  launch DOCKER=1 DOCKER_CACHE=1 DOCKER_CACHE_MAX_AGE_DAYS=1 STUB_RM_INUSE="$inuse" STUB_RM_MISSING="$gone" -- true
+  rc_is 0
+  logged "^volume rm $old\$"; [ ! -e "$STATE/$old" ] || fail "old stamp not removed"
+  in_out "Removed Docker cache $old"
+  [ -e "$STATE/$young" ] || fail "young stamp removed"; not_logged "volume rm $young"
+  [ -e "$STATE/$inuse" ] || fail "in-use stamp removed"
+  [ ! -e "$STATE/$gone" ] || fail "stamp of an already deleted volume kept"
+  ! grep -q "Removed Docker cache $gone" "$CASE/err" || fail "reported a removal that did not happen"
+  not_logged 'volume rm (not-a-cache|claude-pod-docker-short)'; [ -e "$STATE/not-a-cache" ] || fail "foreign file removed"
+}
+test_prune_settings() {   # 0 disables, garbage is rejected before anything starts
+  setup_case; mkdir -p "$STATE"; touch -d '400 days ago' "$STATE/claude-pod-docker-aaaaaaaaaaaaaaaa"
+  launch DOCKER=1 DOCKER_CACHE=1 DOCKER_CACHE_MAX_AGE_DAYS=0 -- true
+  rc_is 0; not_logged 'volume rm claude-pod-docker-'
+  setup_case; launch DOCKER=1 DOCKER_CACHE=1 DOCKER_CACHE_MAX_AGE_DAYS=abc -- true
+  rc_is 1; in_out 'must be a number of days'; not_logged '^run -d'
+}
+test_sidecar_dead() {   # exited sidecar: reported immediately with the userns hint, then cleaned up
+  setup_case; local s=$SECONDS; launch DOCKER=1 STUB_SIDECAR_DEAD=1 -- true
+  rc_is 1; [ $((SECONDS - s)) -lt 10 ] || fail "took the full readiness timeout"
+  in_out 'exited during startup'; in_out 'unprivileged user namespaces'
+  not_logged '^run --rm'; order '^rm -f -v sidecarid' '^network rm' '^volume rm claude-pod-certs-'
+}
+test_term_startup() {   # SIGTERM while the sidecar is starting: 143 and everything removed
+  setup_case; launch_bg DOCKER=1 STUB_READY_AFTER=1000 -- true
+  wait_for "$STUB_DIR/sidecar"; sleep 1; kill -TERM "$LPID"; finish_bg
+  rc_is 143; not_logged '^run --rm'; order '^rm -f -v sidecarid' '^network rm' '^volume rm claude-pod-certs-'
+}
+test_double_term_startup() {   # a second SIGTERM during cleanup must not cut it short
+  setup_case; launch_bg DOCKER=1 STUB_READY_AFTER=1000 STUB_NETRM_SLEEP=3 -- true
+  wait_for "$STUB_DIR/sidecar"; sleep 1; kill -TERM "$LPID"
+  wait_for_log() { local i; for i in $(seq 1 100); do grep -q '^network rm' "$STUB_LOG" && return 0; sleep 0.1; done; fail "cleanup never started"; }
+  wait_for_log; sleep 0.5; kill -TERM "$LPID" 2>/dev/null; finish_bg
+  logged '^volume rm claude-pod-certs-'
+}
+test_term_running() {   # SIGTERM while the pod runs: pod is stopped first, its status (143) is reported, then cleanup
+  setup_case; launch_bg DOCKER=1 STUB_POD_SLEEP=1 -- sleep 60
+  wait_for "$STUB_DIR/pod-running"; kill -TERM "$LPID"; finish_bg
+  rc_is 143; order '^stop -t 10 claude-pod-run-' '^rm -f claude-pod-run-' '^rm -f -v sidecarid' '^network rm' '^volume rm claude-pod-certs-'
+}
+
+# ---- mutants: each must make its test fail, proving the test discriminates -----------------------------
+mutate() {   # mutate <test> <old> <new>   (literal replacement in a copy of the launcher)
+  local test="$1" old="$2" new="$3" src; src="$(cat "$ROOT/claude-pod"; echo x)"; src="${src%x}"
+  [[ "$src" == *"$old"* ]] || { echo "  ERROR  mutant for $test does not apply: $old"; return 1; }
+  printf '%s' "${src/"$old"/$new}" > "$T/mutant"; chmod +x "$T/mutant"
+  if ( LAUNCHER="$T/mutant" "$0" --inner "$test" >/dev/null 2>&1 ); then
+    echo "  SURVIVED  $test passes without: ${old%%$'\n'*}"; return 1
+  fi
+  echo "  killed    $test fails without: ${old%%$'\n'*}"
+}
+run_mutants() {
+  local rc=0
+  mutate test_sequence      $'  ${DOCKER:+--init} \\\n' '' || rc=1
+  mutate test_sequence      $'  docker network rm "$DIND_NET" >/dev/null 2>&1 || true\n' '' || rc=1
+  mutate test_option_validation 'die "$_v must be 1 (or unset), not '"'"'${!_v}'"'"'."' 'true' || rc=1
+  mutate test_cache_new     'DIND_NAME="claude-pod-dind-cache-$_hash"' 'DIND_NAME="claude-pod-dind-$RUN_ID"' || rc=1
+  mutate test_prune         '-mmin +$(( max_days * 1440 ))' '-mmin +0' || rc=1
+  mutate test_prune         'elif grep -qi '"'"'no such volume'"'"' <<<"$out"; then' 'elif false; then' || rc=1
+  mutate test_double_term_startup $'  trap \'\' INT TERM HUP\n' '' || rc=1
+  mutate test_term_running  'trap stop_pod TERM INT HUP' 'trap "" TERM INT HUP' || rc=1
+  return $rc
+}
+
+# ---- main ----------------------------------------------------------------------------------------------
+if [ "${1:-}" = --inner ]; then "$2"; exit $?; fi
+tests=("$@"); [ ${#tests[@]} -gt 0 ] || mapfile -t tests < <(declare -F | awk '$3 ~ /^test_/ {print $3}')
+failed=0
+for t in "${tests[@]}"; do
+  if ( "$t" ); then echo "  ok        $t"; else echo "  FAILED    $t"; failed=1; fi
+done
+if [ $# -eq 0 ] && [ "$LAUNCHER" = "$ROOT/claude-pod" ]; then echo "mutants:"; run_mutants || failed=1; fi
+exit $failed
