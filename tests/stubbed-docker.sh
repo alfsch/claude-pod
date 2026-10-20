@@ -23,12 +23,27 @@ LAUNCHER="${LAUNCHER:-$ROOT/claude-pod}"
 #   STUB_RM_INUSE / STUB_RM_MISSING   space-separated volume names for which `volume rm` fails
 #                         with the real Docker 28 wording ("volume is in use" / "no such volume")
 #   STUB_NETRM_SLEEP=N    `network rm` takes N seconds (widens the cleanup window for signals)
+#   STUB_UID / STUB_GID   what `id -u` / `id -g` report (default 1000, so the real host uid never matters)
+#   STUB_UNAME=Darwin     what `uname -s` reports (default Linux)
+#   STUB_POD_LINGER=N     after `docker stop` the container is gone ("No such container") but the client
+#                         keeps running N more seconds, like a client still writing output; a second signal
+#                         to it is recorded in client-killed (the real client then exits 1 and cuts the output)
+#   STUB_POD_DRAIN=N      the container is already gone when the client starts (the pod ended by itself, --rm) but
+#                         the client keeps writing for N seconds; like Docker's client it survives two signals
+#                         and exits 1 on the third (client-killed)
+#   STUB_STOP_ERROR_AT=N  the Nth `docker stop` of the pod fails with an error other than "No such container"
+#   STUB_DERIVED_EXISTS=1 the derived sidecar image already exists; STUB_BUILD_FAIL=1 `docker build` fails
 cat >"$BIN/docker" <<'STUB'
 #!/usr/bin/env bash
 echo "$*" >> "$STUB_LOG"
 case "$1" in
   info) exit 0 ;;
-  image) [ "$2" = ls ] && echo abc123; exit 0 ;;
+  image)
+    if [[ "$*" == *claude-pod-dind* ]]; then
+      { [ -n "${STUB_DERIVED_EXISTS:-}" ] || [ -e "$STUB_DIR/built" ]; } && echo derivedid; exit 0
+    fi
+    [ "$2" = ls ] && echo abc123; exit 0 ;;
+  build) cat > "$STUB_DIR/dockerfile"; : > "$STUB_DIR/built"; exit "${STUB_BUILD_FAIL:-0}" ;;
   network) [ "$2" = rm ] && sleep "${STUB_NETRM_SLEEP:-0}"; exit 0 ;;
   volume)
     case "$2" in
@@ -48,13 +63,25 @@ case "$1" in
       fi
       : > "$STUB_DIR/sidecar"; echo sidecarid; exit 0
     fi
-    if [ -n "${STUB_POD_SLEEP:-}" ]; then
+    if [ -n "${STUB_POD_SLEEP:-}${STUB_POD_DRAIN:-}" ]; then
       : > "$STUB_DIR/pod-created"; sleep "${STUB_POD_CREATE_DELAY:-0}"
-      sleep "$STUB_POD_SLEEP" & s=$!
-      trap 'kill $s 2>/dev/null; exit 143' TERM
+      sleep "${STUB_POD_SLEEP:-$STUB_POD_DRAIN}" & s=$!
+      term() {
+        if [ -n "${STUB_POD_DRAIN:-}" ]; then
+          echo x >> "$STUB_DIR/client-signals"
+          [ "$(wc -l < "$STUB_DIR/client-signals")" -ge 3 ] || return 0
+          : > "$STUB_DIR/client-killed"; exit 1
+        fi
+        if [ -e "$STUB_DIR/pod-stopped" ]; then : > "$STUB_DIR/client-killed"; exit 1; fi
+        kill $s 2>/dev/null
+        if [ -n "${STUB_POD_LINGER:-}" ]; then : > "$STUB_DIR/pod-stopped"; sleep "$STUB_POD_LINGER" & wait $!; fi
+        exit 143
+      }
+      trap term TERM
       echo $$ > "$STUB_DIR/pod.pid"
       echo started > "$STUB_DIR/pod-running"
-      wait $s
+      [ -z "${STUB_POD_DRAIN:-}" ] || : > "$STUB_DIR/pod-stopped"
+      while kill -0 $s 2>/dev/null; do wait $s 2>/dev/null; done
     fi
     exit "${STUB_POD_EXIT:-0}" ;;
   exec)
@@ -68,6 +95,9 @@ case "$1" in
   stop)
     # Stopping the pod ends the stub pod; its own exit code (143) is what the launcher must report.
     if [[ "$*" == *claude-pod-run-* ]]; then
+      if [ -e "$STUB_DIR/pod-stopped" ]; then echo 'Error response from daemon: No such container: x' >&2; exit 1; fi
+      n="$(cat "$STUB_DIR/stops" 2>/dev/null || echo 0)"; echo $((n + 1)) > "$STUB_DIR/stops"
+      [ "$((n + 1))" != "${STUB_STOP_ERROR_AT:-0}" ] || { echo 'Error response from daemon: connection reset by peer' >&2; exit 1; }
       if [ ! -f "$STUB_DIR/pod.pid" ]; then
         [ -f "$STUB_DIR/pod-created" ] && exit 0   # created, not started: succeeds and does nothing
         echo 'Error response from daemon: No such container' >&2; exit 1
@@ -79,6 +109,15 @@ case "$1" in
 esac
 STUB
 chmod +x "$BIN/docker"
+cat >"$BIN/id" <<'STUB'
+#!/usr/bin/env bash
+case "${1:-}" in -u) echo "${STUB_UID:-1000}" ;; -g) echo "${STUB_GID:-1000}" ;; *) exec /usr/bin/id "$@" ;; esac
+STUB
+cat >"$BIN/uname" <<'STUB'
+#!/usr/bin/env bash
+case "${1:-}" in -s) echo "${STUB_UNAME:-Linux}" ;; *) exec /usr/bin/uname "$@" ;; esac
+STUB
+chmod +x "$BIN/id" "$BIN/uname"
 
 # ---- harness -------------------------------------------------------------------------------------------
 fail() { echo "    FAIL: $*" >&2; [ -f "$CASE/out" ] && sed 's/^/    out| /' "$CASE/out" >&2; [ -f "$CASE/err" ] && sed 's/^/    err| /' "$CASE/err" >&2; [ -f "$STUB_LOG" ] && sed 's/^/    log| /' "$STUB_LOG" >&2; exit 1; }
@@ -88,19 +127,19 @@ setup_case() {
   STATE="$H/state/claude-pod/caches"
   mkdir -p "$PROJ" "$H"
   export STUB_LOG="$CASE/docker.log" STUB_DIR="$CASE/stub"; mkdir -p "$STUB_DIR"; : > "$STUB_LOG"
-  HASH="$(cd "$PROJ" && pwd -P | sha256sum | cut -c1-16)"
+  HASH="$(cd "$PROJ" && { pwd -P; echo 1000:1000; } | sha256sum | cut -c1-16)"   # the stub reports uid and gid 1000
 }
 launch_env() { cd "$PROJ" && HOME="$H" XDG_STATE_HOME="$H/state" CLAUDE_POD_NO_UPDATE=1 PATH="$BIN:$PATH" "$@"; }
 launch() {   # launch <env VAR=...>... -- args   (foreground; sets RC)
   local envs=(); while [ "$1" != -- ]; do envs+=("$1"); shift; done; shift
-  RC=0; (launch_env env "${envs[@]}" timeout 60 "$LAUNCHER" "$@" </dev/null >"$CASE/out" 2>"$CASE/err") || RC=$?
+  RC=0; (launch_env env ${envs[@]+"${envs[@]}"} timeout 60 "$LAUNCHER" "$@" </dev/null >"$CASE/out" 2>"$CASE/err") || RC=$?
 }
 launch_bg() { # same, background; sets LPID
   local envs=(); while [ "$1" != -- ]; do envs+=("$1"); shift; done; shift
   # Job control (set -m) gives the background launcher default signal dispositions; without it a non-interactive
   # shell starts async commands with SIGINT ignored, and bash cannot trap a signal that was ignored on entry.
   set -m
-  (launch_env exec env "${envs[@]}" "$LAUNCHER" "$@" </dev/null >"$CASE/out" 2>"$CASE/err") &
+  (launch_env exec env ${envs[@]+"${envs[@]}"} "$LAUNCHER" "$@" </dev/null >"$CASE/out" 2>"$CASE/err") &
   LPID=$!
   set +m
   ( sleep 45; kill -9 "$LPID" 2>/dev/null ) & WD=$!
@@ -115,7 +154,7 @@ order() {    # order <regex>... : first match of each appears in this order
     n="$(grep -nE -- "$re" "$STUB_LOG" | head -n1 | cut -d: -f1)"; [ -n "$n" ] || fail "missing docker call: $re"
     [ "$n" -gt "$last" ] || fail "docker call out of order: $re"; last=$n; done
 }
-wait_for() { local i; for i in $(seq 1 100); do [ -e "$1" ] && return 0; sleep 0.1; done; fail "timed out waiting for $1"; }
+wait_for() { local _; for _ in $(seq 1 100); do [ -e "$1" ] && return 0; sleep 0.1; done; fail "timed out waiting for $1"; }
 
 # ---- tests ---------------------------------------------------------------------------------------------
 test_plain_exec() {   # without DOCKER=1 the launcher only execs docker run (invariant 7)
@@ -165,6 +204,50 @@ test_cache_conflict() {   # name already taken: refuse, point at the leftover, t
   not_logged '^run --rm'; not_logged '^(stop|rm -f -v)'
   logged '^network rm '
 }
+test_host_uid() {   # Linux, uid other than 1000: derived sidecar image for that uid, built once, before the sidecar
+  setup_case; launch DOCKER=1 STUB_UID=1001 STUB_GID=1002 -- true
+  rc_is 0
+  logged '^build -q -t claude-pod-dind:uid1001-gid1002-[0-9a-f]{64} --build-arg BASE=docker:[0-9a-z.-]+-dind-rootless@sha256:[0-9a-f]{64} --build-arg U=1001 --build-arg G=1002 --build-arg SUB=100000 -$'
+  logged '^run -d --privileged --init .* claude-pod-dind:uid1001-gid1002-[0-9a-f]{64}$'
+  order '^build ' '^network create' '^run -d'
+  grep -q 'rootless:x:\$U:\$G:' "$STUB_DIR/dockerfile" || fail "Dockerfile does not renumber the rootless user"
+  in_out 'Building Docker sidecar image for uid 1001'
+  setup_case; launch DOCKER=1 STUB_UID=1001 STUB_GID=1002 STUB_DERIVED_EXISTS=1 -- true   # already built: reused
+  rc_is 0; not_logged '^build '; logged '^run -d .* claude-pod-dind:uid1001-gid1002-'
+}
+test_host_uid_subid_range() {   # the subordinate id range must not contain the host uid or gid (else dockerd cannot start)
+  local c; for c in "1001 1002 100000" "100000 1001 200000" "1001 150000 200000" "165535 165536 200000" "165536 1001 100000" \
+                    "150000 200000 300000" "200000 200000 100000" "4294960000 1000 100000" "1001 4294967293 100000"; do
+    set -- $c; setup_case; launch DOCKER=1 STUB_UID=$1 STUB_GID=$2 -- true
+    rc_is 0; logged " --build-arg U=$1 --build-arg G=$2 --build-arg SUB=$3 -\$"
+  done
+  grep -q 'rootless:\$SUB:65536' "$STUB_DIR/dockerfile" || fail "Dockerfile does not write the subordinate range"
+  grep -q '/etc/subuid' "$STUB_DIR/dockerfile" && grep -q '/etc/subgid' "$STUB_DIR/dockerfile" || fail "range written to only one of subuid/subgid"
+}
+test_host_uid_skipped() {   # stock image: uid 1000, root, a non-Linux host, a user-set DIND_IMAGE
+  local c; for c in "STUB_UID=1000" "STUB_UID=0" "STUB_UID=1001 STUB_UNAME=Darwin" "STUB_UID=1001 DIND_IMAGE=my/dind:1"; do
+    setup_case; launch DOCKER=1 $c -- true
+    rc_is 0; not_logged '^build '; not_logged 'claude-pod-dind:'
+  done
+  logged '^run -d .* my/dind:1$'
+}
+test_host_uid_build_fails() {   # no sidecar without its image
+  setup_case; launch DOCKER=1 STUB_UID=1001 STUB_BUILD_FAIL=1 -- true
+  rc_is 1; in_out 'Could not build the Docker sidecar image for uid 1001'; not_logged '^run '
+}
+test_host_uid_cache() {   # the cache volume of the derived image is separate from the one owned by uid 1000
+  setup_case; launch DOCKER=1 DOCKER_CACHE=1 STUB_UID=1001 -- true
+  local h; h="$(cd "$PROJ" && { pwd -P; echo 1001:1000; } | sha256sum | cut -c1-16)"
+  rc_is 0; in_out "created new claude-pod-docker-$h"; logged "^run -d .*--name claude-pod-dind-cache-$h "
+  [ "$h" != "$HASH" ] || fail "uid not part of the hash"
+  # same uid, other primary group (sg, newgrp): another derived image, so another volume
+  setup_case; launch DOCKER=1 DOCKER_CACHE=1 STUB_UID=1001 STUB_GID=1002 -- true
+  local h2; h2="$(cd "$PROJ" && { pwd -P; echo 1001:1002; } | sha256sum | cut -c1-16)"
+  rc_is 0; in_out "created new claude-pod-docker-$h2"; [ "$h2" != "$h" ] || fail "gid not part of the hash"
+  # a user-set DIND_IMAGE keeps the stock image (uid 1000): same cache as on a uid 1000 host, not the derived one
+  setup_case; launch DOCKER=1 DOCKER_CACHE=1 STUB_UID=1001 DIND_IMAGE=my/dind:1 -- true
+  rc_is 0; in_out "created new claude-pod-docker-$HASH"
+}
 test_prune() {   # old stamps pruned; young, in-use and foreign files kept; gone volumes lose only the stamp
   setup_case; mkdir -p "$STATE"
   local old=claude-pod-docker-aaaaaaaaaaaaaaaa young=claude-pod-docker-bbbbbbbbbbbbbbbb \
@@ -202,7 +285,7 @@ test_term_startup() {   # SIGTERM while the sidecar is starting: 143 and everyth
 test_double_term_startup() {   # a second SIGTERM during cleanup must not cut it short
   setup_case; launch_bg DOCKER=1 STUB_READY_AFTER=1000 STUB_NETRM_SLEEP=3 -- true
   wait_for "$STUB_DIR/sidecar"; sleep 1; kill -TERM "$LPID"
-  wait_for_log() { local i; for i in $(seq 1 100); do grep -q '^network rm' "$STUB_LOG" && return 0; sleep 0.1; done; fail "cleanup never started"; }
+  wait_for_log() { local _; for _ in $(seq 1 100); do grep -q '^network rm' "$STUB_LOG" && return 0; sleep 0.1; done; fail "cleanup never started"; }
   wait_for_log; sleep 0.5; kill -TERM "$LPID" 2>/dev/null; finish_bg
   logged '^volume rm claude-pod-certs-'
 }
@@ -241,6 +324,26 @@ test_term_during_pod_creation() {   # a stop that hits the created-but-not-start
   wait_for "$STUB_DIR/pod-created"; kill -TERM "$LPID"; finish_bg
   rc_is 143; order '^stop -t 10 claude-pod-run-' '^rm -f -v sidecarid' '^network rm'
 }
+test_stop_while_client_drains() {   # the container is gone but its client is still finishing: leave it alone
+  setup_case; launch_bg DOCKER=1 STUB_POD_SLEEP=60 STUB_POD_LINGER=3 -- sleep 60
+  wait_for "$STUB_DIR/pod-running"; kill -TERM "$LPID"; finish_bg
+  rc_is 143; [ ! -e "$STUB_DIR/client-killed" ] || fail "the client was signalled again while it was finishing its output"
+  [ "$(grep -c '^stop -t 10 claude-pod-run-' "$STUB_LOG")" -le 2 ] || fail "stop was retried after the container was gone"
+  order '^stop -t 10 claude-pod-run-' '^rm -f -v sidecarid' '^network rm'
+}
+test_stop_after_natural_exit() {   # the pod ended by itself and its client is still writing: a stop request must not cut it
+  setup_case; launch_bg DOCKER=1 STUB_POD_DRAIN=4 -- true
+  wait_for "$STUB_DIR/pod-running"; kill -TERM "$LPID"; finish_bg
+  rc_is 0; [ ! -e "$STUB_DIR/client-killed" ] || fail "the client was signalled until it gave up while it was still writing"
+  [ "$(wc -l < "$STUB_DIR/client-signals")" -le 1 ] || fail "the client was signalled more than once"
+  order '^stop -t 10 claude-pod-run-' '^rm -f -v sidecarid' '^network rm'
+}
+test_stop_error_is_retried() {   # a stop that fails for another reason than "no such container" must not end the retries
+  setup_case; launch_bg DOCKER=1 STUB_POD_SLEEP=8 STUB_POD_CREATE_DELAY=3 STUB_STOP_ERROR_AT=2 -- sleep 8
+  wait_for "$STUB_DIR/pod-created"; kill -TERM "$LPID"; finish_bg
+  rc_is 143; [ "$(cat "$STUB_DIR/stops")" -ge 3 ] || fail "stop was not retried after the error"
+  order '^stop -t 10 claude-pod-run-' '^rm -f -v sidecarid' '^network rm'
+}
 test_term_before_pod_pid() {   # a stop request in the gap before POD_PID is known must not be lost
   setup_case
   # The gap is microseconds wide, so inject the signal into a copy of the launcher right before the pod starts.
@@ -255,6 +358,7 @@ test_term_before_pod_pid() {   # a stop request in the gap before POD_PID is kno
 # ---- mutants: each must make its test fail, proving the test discriminates -----------------------------
 mutate() {   # mutate <test> <old> <new>   (literal replacement in a copy of the launcher)
   local test="$1" old="$2" new="$3" src; src="$(cat "$ROOT/claude-pod"; echo x)"; src="${src%x}"
+  declare -F "$test" >/dev/null || { echo "  ERROR  mutant names an unknown test: $test"; return 1; }
   [[ "$src" == *"$old"* ]] || { echo "  ERROR  mutant for $test does not apply: $old"; return 1; }
   printf '%s' "${src/"$old"/$new}" > "$T/mutant"; chmod +x "$T/mutant"
   if ( LAUNCHER="$T/mutant" "$0" --inner "$test" >/dev/null 2>&1 ); then
@@ -269,6 +373,19 @@ run_mutants() {
   mutate test_sequence      $'  docker network rm "$DIND_NET" >/dev/null 2>&1 || true\n' '' || rc=1
   mutate test_option_validation 'die "$_v must be 1 (or unset), not '"'"'${!_v}'"'"'."' 'true' || rc=1
   mutate test_cache_new     'DIND_NAME="claude-pod-dind-cache-$_hash"' 'DIND_NAME="claude-pod-dind-$RUN_ID"' || rc=1
+  mutate test_host_uid_skipped '[ "$(id -u)" != 1000 ] && [ "$(id -u)" != 0 ]' '[ "$(id -u)" != 0 ]' || rc=1
+  mutate test_host_uid_skipped ' && [ "$(id -u)" != 0 ]; then' '; then' || rc=1
+  mutate test_host_uid_skipped '[ -z "$_dind_image_set" ] && ' '' || rc=1
+  mutate test_host_uid_skipped '[ "$(uname -s)" = Linux ] && ' '' || rc=1
+  mutate test_host_uid      'if [ -z "$(docker image ls -q "$DIND_IMAGE" 2>/dev/null)" ]; then' 'if true; then' || rc=1
+  mutate test_host_uid_cache 'echo "${DIND_UID:-1000}:${DIND_GID:-1000}"' 'echo "$(id -u):$(id -g)"' || rc=1
+  mutate test_host_uid_cache 'echo "${DIND_UID:-1000}:${DIND_GID:-1000}"' 'echo 1000:1000' || rc=1
+  mutate test_host_uid_cache 'echo "${DIND_UID:-1000}:${DIND_GID:-1000}"' 'echo "${DIND_UID:-1000}:1000"' || rc=1
+  mutate test_host_uid_subid_range '(DIND_UID >= _sub && DIND_UID < _sub + 65536)' '0' || rc=1
+  mutate test_host_uid_subid_range '(DIND_GID >= _sub && DIND_GID < _sub + 65536)' '0' || rc=1
+  mutate test_host_uid_subid_range 'DIND_UID < _sub + 65536' 'DIND_UID < _sub + 1' || rc=1
+  mutate test_host_uid_subid_range 'DIND_GID < _sub + 65536' 'DIND_GID < _sub + 1' || rc=1
+  mutate test_host_uid_subid_range ' | tee /etc/subuid > /etc/subgid' ' > /etc/subuid' || rc=1
   mutate test_prune         '-mmin +$(( max_days * 1440 ))' '-mmin +0' || rc=1
   mutate test_prune         'elif grep -qi '"'"'no such volume'"'"' <<<"$out"; then' 'elif false; then' || rc=1
   mutate test_double_term_startup $'  trap \'\' INT TERM HUP\n' '' || rc=1
@@ -277,7 +394,11 @@ run_mutants() {
   mutate test_stop_signal   '[ "$#" -eq 1 ] && [ "$1" = bash ]' '[ "$1" = bash ]' || rc=1
   mutate test_term_before_pod_pid $'  [ -z "$STOP_REQUESTED" ] || stop_pod\n' '' || rc=1
   mutate test_term_during_pod_creation $'  [ -z "$STOP_REQUESTED" ] || stop_pod\n' '' || rc=1
-  mutate test_term_before_pod_pid 'STOP_REQUESTED=1; docker stop' 'docker stop' || rc=1
+  mutate test_term_before_pod_pid $'  STOP_REQUESTED=1\n' '' || rc=1
+  mutate test_stop_while_client_drains 'elif [ -n "$POD_SEEN" ]; then POD_GONE=1' 'elif false; then POD_GONE=1' || rc=1
+  mutate test_stop_while_client_drains $'  [ -z "$POD_GONE" ] || return 0\n' '' || rc=1
+  mutate test_stop_error_is_retried "elif ! grep -qi 'no such container' <<<\"\$_out\"; then :" 'elif false; then :' || rc=1
+  mutate test_stop_after_natural_exit '[ -n "$POD_PID" ] && [ -z "$POD_KILLED" ]; then POD_KILLED=1;' '[ -n "$POD_PID" ]; then' || rc=1
   mutate test_term_running  'trap stop_pod TERM INT HUP' 'trap "" TERM INT HUP' || rc=1
   mutate test_int_hup_running 'trap stop_pod TERM INT HUP' 'trap stop_pod TERM' || rc=1
   mutate test_int_hup_startup "trap 'exit 130' INT" "trap 'exit 1' INT" || rc=1
@@ -287,7 +408,14 @@ run_mutants() {
 
 # ---- main ----------------------------------------------------------------------------------------------
 if [ "${1:-}" = --inner ]; then "$2"; exit $?; fi
-tests=("$@"); [ ${#tests[@]} -gt 0 ] || mapfile -t tests < <(declare -F | awk '$3 ~ /^test_/ {print $3}')
+# No mapfile (not in Bash 3.2) and no silent empty run: an empty list would skip the baseline and let every
+# mutant count as killed.
+tests=("$@")
+if [ ${#tests[@]} -eq 0 ]; then
+  # shellcheck disable=SC2207  # the words are test names, and mapfile is what must be avoided
+  tests=($(declare -F | awk '$3 ~ /^test_/ {print $3}'))
+fi
+[ ${#tests[@]} -gt 0 ] || { echo "  ERROR     no tests found" >&2; exit 1; }
 failed=0
 for t in "${tests[@]}"; do
   if ( "$t" ); then echo "  ok        $t"; else echo "  FAILED    $t"; failed=1; fi
