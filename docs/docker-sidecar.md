@@ -9,12 +9,12 @@ change the feature: how it is built, why, and how to test it.
 
 ```
 host Docker  ──runs──▶  pod (claude-pod image)         cap-drop=ALL, no-new-privileges, seccomp, --init
-             └─runs──▶  sidecar (docker:28-dind-rootless, --privileged)
+             └─runs──▶  sidecar (docker:<N>-dind-rootless, --privileged)
                          ▲  private per-run network, mTLS on 2376 (port never published)
                          └─ certs in a per-run volume, mounted read-only into the pod
 ```
 
-- Only the sidecar is privileged; its dockerd runs as uid 1000 in a user namespace. The host Docker
+- Only the sidecar is privileged; its dockerd runs as uid 1000 in a user namespace (the host uid on Linux, see "Host uid"). The host Docker
   socket is never mounted. The pod only has the `docker` CLI (plus Compose and Buildx) with `DOCKER_HOST`
   pointing at the sidecar.
 - `DOCKER_CACHE=1` additionally keeps the sidecar's data directory in a per-project named volume.
@@ -40,7 +40,18 @@ host Docker  ──runs──▶  pod (claude-pod image)         cap-drop=ALL, n
    repeats `docker stop` until the pod is gone. Two windows need that: before `POD_PID` is known, and
    between Docker creating the pod container and starting it, where `docker stop` succeeds without
    effect (measured: rc 0, state stays `created`, the waiting `docker run` then starts it anyway; 15/15
-   stops lost without the retry, 0/15 with it).
+   stops lost without the retry, 0/15 with it). Once a stop has succeeded and a later one finds no container
+   (`POD_SEEN`, then `POD_GONE`), the retries end and the client is left alone: the container is gone (`--rm`)
+   but the client may still be writing the pod's output, and signalling it again cut that output and, from
+   the third signal on, made it exit 1 instead of with the pod's status (measured: pod printing 1 MB on
+   SIGTERM into a stalled reader, exit 7 expected: exit 1 and 65536 of 1000000 bytes before, exit 7 and all
+   bytes after; Docker's client says `got 3 SIGTERM/SIGINTs, forcefully exiting`). The same happens when the
+   pod ended by itself (so no stop ever succeeded, `POD_SEEN` stays empty) and the signal arrives while the
+   client still writes: the kill fallback is therefore used at most once (`POD_KILLED`), which is enough for a
+   container that does not exist yet (measured: pod printing 1 MB and exiting 0, TERM while the client was
+   stalled: exit 1 and 65536 bytes before, exit 0 and all bytes after). Only Docker's `No such container`
+   counts as "gone"; any other `docker stop` error (daemon busy, a dropped connection) is retried, otherwise a
+   hiccup between "created" and "started" would end the retries and the pod would start and keep running.
 6. The pod gets `--init` (only with `DOCKER=1`): with a bare shell or node as PID 1 the stop signal is
    ignored and the pod dies only after the 10s grace period (exit 137). `--init` is not enough for the
    default command: interactive Bash (TTY) ignores SIGTERM even as a child of tini (measured with
@@ -89,6 +100,59 @@ Deliberately not done:
 A launcher backgrounded by a non-interactive shell (script, CI) inherits SIGINT as ignored and Bash cannot
 override that; such launches must be cancelled with SIGTERM (documented in the README).
 
+## Host uid
+
+The sidecar's dockerd runs as uid 1000 (the image's `rootless` user) and the project folder is bind-mounted
+into it. An inner container's root maps to that uid, and `--user N` maps to a subordinate uid, so on a host
+where the project folder belongs to another uid neither could write to it. Measured on a native Linux host
+with host uid 1001 and a folder owned by 1001 (mode 775): the pod itself could write, `docker run -v
+"$PWD:$PWD" alpine touch f` inside the pod failed with `Permission denied` (as root and with
+`--user 1001:1001`), and with the folder at mode 777 it worked but the file was owned by uid 1000.
+
+So on Linux with a uid other than 1000 (and other than 0: rootless dockerd cannot run as root) the launcher
+builds a derived sidecar image, once per uid and base digest: `claude-pod-dind:uid<uid>-gid<gid>-<digest>`,
+from the pinned base, built from a Dockerfile on stdin (no build context). It only renumbers the `rootless`
+user to the host uid and gid in `/etc/passwd` and `/etc/group` and chowns its home. Nothing else is needed:
+the entrypoint takes uid and paths from `id -u` and `$HOME`, and the subuid and subgid ranges are keyed by
+the user name, so they stay valid (inner containers still get a full range, so `chown 5000` works and shows
+up as a uid from that range on the host). Inner root then writes to the project as the host user.
+
+The subordinate range of the image is 100000..165535. If the host uid or gid lies inside it, inner root and a
+subordinate id would map to the same outer id, Linux rejects that map (`newuidmap: write to uid_map failed:
+Invalid argument`) and the sidecar does not start. This happens with accounts from a directory service. So
+the derived image writes its own range to `/etc/subuid` and `/etc/subgid`: 100000..165535 as before unless
+the host uid or gid lies in it, then the first free block of 65536 ids at 200000, 300000, ... (two ids block
+at most two blocks, and a fixed step cannot run past the 32-bit id limit). Checked on a real daemon with
+host ids 100000/100000, 150000/1001 and 1001/165000 (sidecar starts; without the change the first two
+fail with the error above). An existing derived image keeps its old range, which only matters for ids that
+could not run before; `docker rmi` it to rebuild.
+
+Only inner uid 0 and gid 0 map to the host user and group; every other inner id maps into the subordinate
+range. So an inner container running as a non-root user is not helped. Measured with uid 1001 and a folder
+owned by 1001:1001, mode 775, as `alpine:3` with `--user`: `1001:1001` and `1` are denied; `1001` and `1000`
+(no gid given, so gid 0) can write through the group, and the files then belong to subordinate uids
+(100999, 101000) on the host. Builds (`docker build`) and named volumes are not affected: builds only read the
+context and volumes live inside the sidecar. Making non-root inner users work would need the sidecar's id
+mapping to cover them (for example a mapping that includes the host uid inside the user namespace), which is
+not part of this feature.
+
+- A `DIND_IMAGE` set by the user is used as is, and so is a host with uid 1000 or 0 or a non-Linux `uname`
+  (macOS: Docker Desktop's file sharing handles ownership; not tested). WSL2 reports Linux and gets the
+  derived image; not tested either.
+- The cache volume is owned by the sidecar's uid, so a sidecar with another uid cannot use it. The sidecar's
+  uid and gid are therefore part of the cache hash: `sha256(pwd -P, uid:gid)`, with the host ids for the derived
+  image (so another primary group, as with `sg`, gets another volume) and 1000:1000 for the stock image (also
+  with a user-set `DIND_IMAGE`, which is assumed to be a stock-like image).
+  Caches created before that are not reused; the 90-day prune or `uninstall.sh` removes them.
+- `uninstall.sh` removes the `claude-pod-dind:*` tags, and only those (not other tags the images may have). A new base digest from Renovate builds a new derived
+  image on the next start; the old one stays until uninstall (a few MB of layers on top of the base).
+- Tests: the stub covers the decision (uid, root, `uname`, `DIND_IMAGE`), the build call and its failure and
+  the cache hash. That the renumbered image really works needs a daemon on a host with a uid other than 1000:
+  `DOCKER=1 claude-pod sh -c 'docker run --rm -v "$PWD:$PWD" -w "$PWD" alpine:3 touch f'` from a project
+  folder under your home must succeed and leave `f` owned by you. Do not test from `/tmp`: a daemon in a VM
+  or another mount namespace may not see that path, and then even the pod gets `Permission denied` on an
+  empty root-owned directory, which looks the same but is a test setup problem.
+
 ## Host requirement on Ubuntu 24.04+
 
 Rootless dockerd needs unprivileged user namespaces. With `kernel.apparmor_restrict_unprivileged_userns=1`
@@ -99,7 +163,19 @@ section "Requirements for DOCKER=1" (sysctl.d setting and how to undo it). For t
 
 ## Testing
 
-There is no CI. Two layers have been used:
+The stub tests run in CI (`.github/workflows/stub-tests.yaml`: syntax check, ShellCheck and the suite, on pull
+requests and pushes to main) and need no Docker daemon. `tests/integration.sh` runs the essential real-daemon checks
+(`.github/workflows/integration-tests.yaml`, a real `ubuntu-latest` daemon with the image built from the
+Dockerfile): the tools in the pod image, the contract of the pinned sidecar image (the `rootless` user, subuid and
+subgid ranges, `newuidmap`, data dir), a `DOCKER=1` session with inner `run`/`build`/`compose` and project writes,
+exit codes, the cache (create, reuse, exclusivity, prune), TLS refusals, SIGTERM and that nothing is left behind.
+Its purpose is to tell an update of a tooling image (docker CLI, DIND sidecar, node base, yq) from a broken one:
+Renovate merges such updates, majors included, once the required checks pass (`renovate.json`), so these tests are the
+only review they get and must not name a version that Renovate bumps.
+It asserts results and exit codes only, never timings, which are flaky on shared runners, and assumes that no other
+claude-pod session starts on the same daemon while it runs (its leak check compares names before and after); the checklist below
+covers what it does not (signal timing, macOS, WSL2). Run it locally with a daemon and the `claude-pod` image
+(`./install.sh`): `ITEST_TMPDIR=<a directory the daemon can see> tests/integration.sh`. Two layers have been used:
 
 **Stubbed `docker`** (no daemon needed): `tests/stubbed-docker.sh` runs the cases below and then a set of
 mutants (the launcher with one fix removed) that each must make a test fail. Run it after every launcher

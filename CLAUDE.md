@@ -16,13 +16,19 @@ Runs Claude Code in a hardened Docker container scoped to the current folder. Th
 
 ## Testing
 
-- There is no test suite and an agent sandbox usually has no Docker daemon. Test launcher changes with a
-  stubbed `docker` on `PATH`, and make each test fail without the fix (see the docs). Anything that needs a
-  real daemon (rootless sidecar, TLS, cache volumes, signals) has to be run on a host with Docker; the
-  checklist is in `docs/docker-sidecar.md`.
+- The stub tests (`tests/stubbed-docker.sh`, run by `.github/workflows/stub-tests.yaml` on pull requests) need
+  no Docker daemon, which an agent sandbox usually lacks. Test launcher changes with them, and make each test
+  fail without the fix (see the docs). Anything that needs a real daemon (rootless sidecar, TLS, cache volumes,
+  signals) is covered by `tests/integration.sh` (run by `.github/workflows/integration-tests.yaml`) and, for
+  what that does not check, by the checklist in `docs/docker-sidecar.md`, on a host with Docker.
+- Renovate merges updates of GitHub Actions and of the tooling images (docker CLI, DIND sidecar, node base image,
+  yq), majors included, as soon as the required checks pass (`renovate.json`), so those checks are the only
+  review such an update gets. If a merged update breaks something the tests did not notice, the fix includes a
+  new test for it. A test must not name a version Renovate bumps (a stub test once expected `docker:28-...`).
 - Rootless DinD needs unprivileged user namespaces; on Ubuntu 24.04+ that means
   `kernel.apparmor_restrict_unprivileged_userns=0` for the test (set it back to `1` afterwards).
-- Run `bash -n claude-pod uninstall.sh install.sh` after every edit.
+- After every edit run `for f in claude-pod install.sh uninstall.sh tests/stubbed-docker.sh tests/integration.sh; do bash -n "$f"; done`
+  (`bash -n a b c` parses only `a`); CI does that and also runs ShellCheck (`-S warning`).
 
 ## Status
 
